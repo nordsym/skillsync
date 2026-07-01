@@ -8,8 +8,9 @@ you maintain the same skill for more than one harness, you end up with N
 copies that silently drift out of sync -- nobody notices until an agent runs
 on stale instructions.
 
-skillsync does not translate content between formats (that's a rewriting
-task, not a mechanical one -- do it by hand or with an LLM). What it does:
+skillsync does not translate skill *prose* between formats (that's a
+rewriting task, an LLM or a human does it better than a script ever will).
+What it does mechanically:
 
   1. Track one canonical source directory for your skill files.
   2. Stamp each ported copy with a marker recording which version of the
@@ -22,6 +23,11 @@ task, not a mechanical one -- do it by hand or with an LLM). What it does:
   4. Optionally fire a webhook when real drift is found, and optionally
      install a git post-commit hook so drift is caught the moment the
      source changes, not on the next scheduled check.
+  5. Learn each target's frontmatter *shape* (not its prose) from the
+     skills already there, and scaffold a draft in that shape for a new
+     port, pre-filled with the target's fixed fields and the source's raw
+     content for a human/agent to actually adapt. Never auto-stamped, a
+     scaffold is a starting point, not a finished port.
 
 Zero dependencies beyond the Python 3.9+ standard library.
 
@@ -30,6 +36,8 @@ Usage:
   skillsync.py stamp [<skill>] [--all]                # mark port(s) as synced to the current source version
   skillsync.py check [<skill>] [--fail-on-drift] [--webhook]
   skillsync.py install-hook                           # add a post-commit hook to the source repo (git sources only)
+  skillsync.py learn-format [<target>] [--all]        # infer a target's frontmatter shape from its existing skills
+  skillsync.py scaffold <skill> <target> [--force]    # draft a new port in the learned shape, needs manual review
 """
 import argparse
 import hashlib
@@ -121,6 +129,166 @@ def stamp_content(text: str, version: str) -> str:
 def read_stamp(text: str):
     m = re.search(r"synced-from: ([0-9a-f]+)", text)
     return m.group(1) if m else None
+
+
+def parse_frontmatter(text: str):
+    """Returns (fields: dict, has_frontmatter: bool). Only handles simple
+    `key: value` lines, good enough for shape-learning, not a full YAML
+    parser (skillsync stays dependency-free, no pyyaml)."""
+    if not text.startswith("---\n"):
+        return {}, False
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, False
+    fields = {}
+    for line in text[4:end].split("\n"):
+        if ":" in line and not line.startswith(" ") and not line.startswith("-"):
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip().strip('"')
+    return fields, True
+
+
+def learn_format(target_dir: str) -> dict:
+    """Infer a target's frontmatter shape from the skills already ported
+    there: does it use frontmatter at all, which fields recur, and what
+    fixed (non name/description) values are constant across samples (e.g.
+    every Hermes skill in this vault's nordsym/ category has the same
+    author and license). Returns a template, not a full schema, this is
+    shape-inference from examples, not spec parsing.
+    """
+    base = Path(target_dir).expanduser()
+    samples = list(base.glob("**/SKILL.md"))[:20]  # cap, shape doesn't need every file
+    if not samples:
+        return {"has_frontmatter": True, "fixed_fields": {}, "sample_count": 0}
+
+    frontmatter_count = 0
+    field_values = {}  # key -> set of distinct values seen
+    categories = set()  # the directory directly under target_dir each sample lives in
+    for s in samples:
+        fields, has_fm = parse_frontmatter(s.read_text(errors="ignore"))
+        if has_fm:
+            frontmatter_count += 1
+        for k, v in fields.items():
+            if k in ("name", "description"):
+                continue  # always per-skill, never a fixed field
+            field_values.setdefault(k, set()).add(v)
+        rel_parts = s.relative_to(base).parts  # (<category?>/)<skill-name>/SKILL.md
+        if len(rel_parts) == 3:
+            categories.add(rel_parts[0])
+        # len == 2 means flat (<skill-name>/SKILL.md), no category layer
+
+    has_frontmatter = frontmatter_count >= len(samples) / 2
+    # A field is "fixed" if every sample that had it agreed on one value.
+    fixed_fields = {k: next(iter(v)) for k, v in field_values.items() if len(v) == 1}
+    # Only infer a default category if every sample agrees on exactly one.
+    # Mixed or absent categories -> stay flat, the safer default.
+    category = next(iter(categories)) if len(categories) == 1 else None
+
+    return {
+        "has_frontmatter": has_frontmatter,
+        "fixed_fields": fixed_fields,
+        "category": category,
+        "sample_count": len(samples),
+    }
+
+
+def cmd_learn_format(args):
+    config = load_config()
+    targets = config["targets"]
+    if not args.all:
+        if args.target not in targets:
+            sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(targets)}")
+        targets = {args.target: targets[args.target]}
+
+    formats = config.setdefault("formats", {})
+    for name, target_dir in targets.items():
+        result = learn_format(target_dir)
+        formats[name] = result
+        if result["sample_count"] == 0:
+            print(f"{name}: no existing skills found, nothing to learn from yet")
+            continue
+        shape = "frontmatter" if result["has_frontmatter"] else "no frontmatter (plain markdown)"
+        fixed = ", ".join(f"{k}={v}" for k, v in result["fixed_fields"].items()) or "(none)"
+        cat = result["category"] or "flat, no category folder"
+        print(f"{name}: {shape}, from {result['sample_count']} sample(s), fixed fields: {fixed}, layout: {cat}")
+
+    write_config(config)
+    print(f"\nSaved to {CONFIG_FILE}. Run 'skillsync.py scaffold <skill> <target>' to draft a port.")
+
+
+def parse_source_skill(text: str):
+    """Best-effort extraction of a title and one-line description from a
+    Universal/-style source file. These aren't strictly uniform (bold-line
+    'Category:'/'Version:' style vs YAML frontmatter), so this stays
+    forgiving rather than requiring one exact format.
+    """
+    fields, has_fm = parse_frontmatter(text)
+    name = fields.get("name") or fields.get("title")
+    description = fields.get("description")
+
+    if not name:
+        m = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+        name = m.group(1).strip() if m else "unknown-skill"
+    if not description:
+        m = re.search(r"^##\s*Purpose\s*\n+(.+?)(?:\n\n|\n#)", text, re.MULTILINE | re.DOTALL)
+        if m:
+            description = " ".join(m.group(1).split())
+        else:
+            description = f"See source for details: {name}."
+    return name, description
+
+
+def cmd_scaffold(args):
+    config = load_config()
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    src = source_dir / f"{args.skill}.md"
+    if not src.exists():
+        sys.exit(f"No source file for '{args.skill}' in {source_dir}")
+
+    if args.target not in config["targets"]:
+        sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
+    target_dir = config["targets"][args.target]
+
+    fmt = config.get("formats", {}).get(args.target)
+    if fmt is None:
+        print(f"No learned format for '{args.target}' yet, learning now...")
+        fmt = learn_format(target_dir)
+        config.setdefault("formats", {})[args.target] = fmt
+        write_config(config)
+
+    dest = target_file(target_dir, args.skill)
+    if not dest.exists() and fmt.get("category"):
+        # target_file() only finds *existing* files; for a brand-new skill
+        # with no match anywhere yet, place it using the layout learned
+        # from this target's other skills instead of defaulting to flat.
+        dest = Path(target_dir).expanduser() / fmt["category"] / args.skill / "SKILL.md"
+    if dest.exists() and not args.force:
+        sys.exit(f"{dest} already exists. Use --force to overwrite the draft (never overwrites a stamped port silently otherwise).")
+
+    source_text = src.read_text()
+    name, description = parse_source_skill(source_text)
+
+    if fmt["has_frontmatter"]:
+        lines = ["---", f"name: {name}", f"description: {description}"]
+        for k, v in fmt["fixed_fields"].items():
+            lines.append(f"{k}: {v}")
+        lines.append("---")
+        header = "\n".join(lines) + "\n"
+    else:
+        header = ""
+
+    body = (
+        f"\n<!-- skillsync-draft: needs manual review before stamping -->\n\n"
+        f"# {name}\n\n"
+        f"Source of truth: `{src}`.\n\n"
+        f"<!-- Raw source content below, adapt it to this target's voice and format before treating this as final. -->\n\n"
+        f"{source_text}"
+    )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(header + body)
+    print(f"Drafted {dest}")
+    print("This is a starting point, not a finished port. Review and rewrite before running 'stamp'.")
 
 
 def cmd_init(args):
@@ -310,6 +478,15 @@ def main():
 
     sub.add_parser("install-hook", help="install a git post-commit hook in the source repo")
 
+    p_learn = sub.add_parser("learn-format", help="infer a target's frontmatter shape from its existing skills")
+    p_learn.add_argument("target", nargs="?", help="target name (omit with --all)")
+    p_learn.add_argument("--all", action="store_true", help="learn every target")
+
+    p_scaffold = sub.add_parser("scaffold", help="draft a new port in a target's learned shape (needs manual review)")
+    p_scaffold.add_argument("skill", help="skill name")
+    p_scaffold.add_argument("target", help="target name")
+    p_scaffold.add_argument("--force", action="store_true", help="overwrite an existing draft")
+
     args = parser.parse_args()
 
     global CONFIG_FILE
@@ -321,6 +498,8 @@ def main():
         "stamp": cmd_stamp,
         "check": cmd_check,
         "install-hook": cmd_install_hook,
+        "learn-format": cmd_learn_format,
+        "scaffold": cmd_scaffold,
     }[args.command](args)
 
 

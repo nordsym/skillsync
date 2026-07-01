@@ -10,9 +10,10 @@ folder with its own conventions. The moment you maintain the same skill for more
 than one harness, you get N copies. Nobody notices when they drift apart until an
 agent runs on stale instructions.
 
-`skillsync` does **not** translate content between formats. Writing a good
-skill for a specific harness is a rewriting task, not a mechanical one, so
-that part stays a human (or LLM) job. What it does instead:
+`skillsync` does **not** translate skill *prose* between formats. Writing a
+good skill for a specific harness is a rewriting task, an LLM or a human does
+it better than a script ever will, so that part stays deliberate. What it
+does mechanically:
 
 1. Tracks one canonical **source directory** for your skill files.
 2. Stamps each ported copy with a marker recording exactly which version of
@@ -21,6 +22,11 @@ that part stays a human (or LLM) job. What it does instead:
    ports are **missing** or **out of date**.
 4. Optionally fires a webhook when real drift is found, and optionally
    installs a git hook so drift is caught the moment the source changes.
+5. Learns each target's frontmatter *shape* (fields, whether it uses
+   frontmatter at all, whether skills live flat or under a category folder)
+   from the skills already there, and scaffolds a draft in that shape for a
+   new port. Never auto-stamped, a scaffold is a starting point for a human
+   or agent to actually adapt, not a finished translation.
 
 ## Why this doesn't produce false alarms
 
@@ -68,6 +74,15 @@ chmod +x skillsync.py
 ./skillsync.py install-hook
 # (git sources only) fires a check automatically on every commit that
 # touches a skill file, instead of waiting for a scheduled run
+
+./skillsync.py learn-format --all
+# infers each target's frontmatter shape (fields, flat vs categorized
+# layout) from the skills already ported there
+
+./skillsync.py scaffold <skill-name> <target-name>
+# drafts a new port in the learned shape, placed at the right path,
+# pre-filled with fixed fields and the raw source content -- never
+# auto-stamped, review and rewrite the prose before 'stamp'
 ```
 
 ## Config (`skillsync.json`)
@@ -97,12 +112,25 @@ chmod +x skillsync.py
 ## Typical workflow
 
 1. Write or edit a skill in your source directory.
-2. Manually adapt it into each target harness's native format (frontmatter
-   conventions differ per runtime, that part stays your job or your agent's).
+2. Adapt it into each target harness's native format. `scaffold` gets you a
+   correctly-shaped starting point (right frontmatter fields, right folder
+   depth), the actual prose adaptation is still your job or your agent's.
 3. Run `skillsync.py stamp <skill-name>` to mark the ports as current.
 4. Commit the source. If you installed the hook, any future edit that
    doesn't get re-stamped will surface automatically on the next commit,
    not silently.
+
+## Why this doesn't auto-generate the full port
+
+A tool that mechanically infers frontmatter *shape* is safe: getting a field
+name wrong is obvious and harmless. A tool that auto-generates skill *prose*
+via an LLM and silently ships it is a different risk entirely, a subtly
+wrong instruction can make an agent behave incorrectly in production, and
+that shouldn't happen without a human or agent actually reading the result.
+`scaffold` deliberately stops at the shape. If you want full LLM-assisted
+drafting, wire your own model call around the source content, review its
+output, then run `stamp` yourself. Keeping that step manual is the point,
+not a missing feature.
 
 ## License
 
