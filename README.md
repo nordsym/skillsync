@@ -85,8 +85,11 @@ chmod +x skillsync.py
 ```
 
 - `source_dir`: your canonical skill files, one `.md` per skill.
-- `targets`: name to directory. Convention is `<target_dir>/<skill_name>/SKILL.md`,
-  matching what Claude Code, Codex, and most current agent harnesses expect.
+- `targets`: name to directory. Skills are found by searching recursively for
+  `<skill_name>/SKILL.md` under the target directory, so both flat layouts
+  (`<target_dir>/<skill_name>/SKILL.md`, what Claude Code, Codex, and
+  OpenClaw use) and categorized layouts (`<target_dir>/<category>/<skill_name>/SKILL.md`,
+  what Hermes uses) work without extra configuration.
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.

@@ -85,11 +85,26 @@ def find_skills(source_dir: Path):
 
 
 def target_file(target_dir: str, skill_name: str) -> Path:
-    """Convention: <target_dir>/<skill_name>/SKILL.md, matching the layout
-    Claude Code, Codex, and most current agent harnesses expect. Override
-    per-target in config with a "file_pattern" if a harness differs.
+    """Find <skill_name>/SKILL.md under target_dir, at any depth.
+
+    Not every harness uses a flat <target_dir>/<skill_name>/SKILL.md layout.
+    OpenClaw does. Hermes does not -- it nests skills under a category
+    (<target_dir>/<category>/<skill_name>/SKILL.md), and the category isn't
+    knowable from the skill name alone. A shallow glob handles both without
+    per-harness configuration: search recursively for a directory named
+    exactly <skill_name> containing a SKILL.md, wherever it sits.
+
+    Returns the flat <target_dir>/<skill_name>/SKILL.md path if nothing is
+    found (the natural "this doesn't exist yet" default for stamp/check to
+    report MISSING against).
     """
-    return Path(target_dir).expanduser() / skill_name / "SKILL.md"
+    base = Path(target_dir).expanduser()
+    if not base.exists():
+        return base / skill_name / "SKILL.md"
+    matches = list(base.glob(f"**/{skill_name}/SKILL.md"))
+    if matches:
+        return matches[0]
+    return base / skill_name / "SKILL.md"
 
 
 def stamp_content(text: str, version: str) -> str:
