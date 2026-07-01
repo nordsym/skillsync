@@ -207,13 +207,23 @@ def cmd_check(args):
     print(f"OK: {ok}   MISSING: {missing}   STALE: {stale}")
 
     if (missing or stale) and args.webhook and config.get("webhook_url"):
-        send_webhook(config["webhook_url"], missing, missing_list, stale, stale_list)
+        send_webhook(config, missing, missing_list, stale, stale_list)
 
     if args.fail_on_drift and (missing or stale):
         sys.exit(1)
 
 
-def send_webhook(url, missing, missing_list, stale, stale_list):
+def send_webhook(config, missing, missing_list, stale, stale_list):
+    """POSTs a JSON body to config['webhook_url']. Works unmodified against
+    Slack/Discord/Mattermost-style incoming webhooks (a {"text": "..."} body
+    is enough for most of them). Services that need extra fixed fields in the
+    body (Telegram's sendMessage needs chat_id alongside text, for example)
+    can set:
+
+      "webhook_extra": {"chat_id": "-100...", "parse_mode": "HTML"}
+      "webhook_field": "text"   # which key holds the message (default "text",
+                                 # Discord wants "content" instead)
+    """
     lines = ["skillsync: real drift found", ""]
     if missing:
         lines.append(f"Missing ({missing}):")
@@ -222,8 +232,15 @@ def send_webhook(url, missing, missing_list, stale, stale_list):
     if stale:
         lines.append(f"Stale ({stale}):")
         lines += [f"- {s}" for s in stale_list]
-    body = json.dumps({"text": "\n".join(lines)}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+
+    field = config.get("webhook_field", "text")
+    payload = dict(config.get("webhook_extra", {}))
+    payload[field] = "\n".join(lines)
+
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        config["webhook_url"], data=body, headers={"Content-Type": "application/json"}
+    )
     try:
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
