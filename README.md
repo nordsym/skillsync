@@ -20,9 +20,13 @@ does mechanically:
    the source it reflects.
 3. Compares stamps against the source's *current* version and reports which
    ports are **missing** or **out of date**.
-4. Optionally fires a webhook when real drift is found, and optionally
+4. Strips source-only vault wrappers when stamping a port: leading YAML or
+   preamble before the first H1, plus trailing Obsidian `Up:`/hashtag footers.
+   Runtime ports keep the skill body, not the source repo's navigation
+   metadata.
+5. Optionally fires a webhook when real drift is found, and optionally
    installs a git hook so drift is caught the moment the source changes.
-5. Learns each target's frontmatter *shape* (fields, whether it uses
+6. Learns each target's frontmatter *shape* (fields, whether it uses
    frontmatter at all, whether skills live flat or under a category folder)
    from the skills already there, and scaffolds a draft in that shape for a
    new port. Never auto-stamped, a scaffold is a starting point for a human

@@ -52,6 +52,35 @@ CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 
 
+def strip_vault_wrappers(text: str) -> str:
+    """Remove Obsidian/vault-only wrappers from a runtime port.
+
+    Runtime skill ports should carry the skill body, not vault governance
+    metadata. Keep content from the first H1 onward and drop the trailing
+    Obsidian navigation footer.
+    """
+    text = MARKER_RE.sub("", text)
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            text = text[end + len("\n---\n") :]
+
+    h1 = re.search(r"(?m)^#\s+", text)
+    if h1:
+        text = text[h1.start() :]
+
+    lines = text.rstrip().splitlines()
+    while lines and (not lines[-1].strip() or re.match(r"^#[A-Za-z0-9_-]+$", lines[-1].strip())):
+        lines.pop()
+    if lines and lines[-1].startswith("Up: "):
+        lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].strip() == "---":
+        lines.pop()
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def load_config():
     path = Path.cwd() / CONFIG_FILE
     if not path.exists():
@@ -117,13 +146,7 @@ def target_file(target_dir: str, skill_name: str) -> Path:
 
 def stamp_content(text: str, version: str) -> str:
     marker = f"<!-- synced-from: {version} -->\n"
-    text = MARKER_RE.sub("", text)
-    if text.startswith("---\n"):
-        end = text.find("\n---\n", 4)
-        if end != -1:
-            insert_at = end + len("\n---\n")
-            return text[:insert_at] + marker + text[insert_at:]
-    return marker + text
+    return marker + strip_vault_wrappers(text)
 
 
 def read_stamp(text: str):
@@ -265,7 +288,7 @@ def cmd_scaffold(args):
     if dest.exists() and not args.force:
         sys.exit(f"{dest} already exists. Use --force to overwrite the draft (never overwrites a stamped port silently otherwise).")
 
-    source_text = src.read_text()
+    source_text = strip_vault_wrappers(src.read_text())
     name, description = parse_source_skill(source_text)
 
     if fmt["has_frontmatter"]:
