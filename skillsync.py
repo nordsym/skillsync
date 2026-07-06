@@ -140,7 +140,16 @@ def target_file(target_dir: str, skill_name: str) -> Path:
         return base / skill_name / "SKILL.md"
     matches = list(base.glob(f"**/{skill_name}/SKILL.md"))
     if matches:
-        return matches[0]
+        def priority(path: Path):
+            rel = path.relative_to(base)
+            parts = rel.parts
+            if len(parts) == 3 and parts[0] == "nordsym":
+                return (0, str(rel))
+            if len(parts) == 2:
+                return (1, str(rel))
+            return (2, str(rel))
+
+        return sorted(matches, key=priority)[0]
     return base / skill_name / "SKILL.md"
 
 
