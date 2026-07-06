@@ -75,6 +75,10 @@ chmod +x skillsync.py
 ./skillsync.py check --fail-on-drift
 # exit 1 if anything is out of sync, for CI
 
+./skillsync.py registry --output SKILL-REGISTRY.md
+# writes a generated inventory of every target skill, including core ports,
+# local skills, vendor skills, archives, duplicates, and symlink rows
+
 ./skillsync.py install-hook
 # (git sources only) fires a check automatically on every commit that
 # touches a skill file, instead of waiting for a scheduled run
@@ -123,6 +127,20 @@ chmod +x skillsync.py
 4. Commit the source. If you installed the hook, any future edit that
    doesn't get re-stamped will surface automatically on the next commit,
    not silently.
+
+## Registry
+
+`registry` emits a generated markdown inventory across every configured
+target. It is intentionally broader than `check`: `check` only asks whether
+the governed source skills have current ports, while `registry` also shows
+runtime-local skills, vendor skills, archived skills, symlinked rows, and
+duplicate names that could mask a governed port.
+
+```bash
+./skillsync.py registry --output SKILL-REGISTRY.md
+```
+
+Use this when the problem is catalog visibility rather than drift.
 
 ## Why this doesn't auto-generate the full port
 

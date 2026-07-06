@@ -35,11 +35,13 @@ Usage:
   skillsync.py init                                  # write skillsync.json in the current dir
   skillsync.py stamp [<skill>] [--all]                # mark port(s) as synced to the current source version
   skillsync.py check [<skill>] [--fail-on-drift] [--webhook]
+  skillsync.py registry [--output <path>]             # emit a generated inventory of all target skills
   skillsync.py install-hook                           # add a post-commit hook to the source repo (git sources only)
   skillsync.py learn-format [<target>] [--all]        # infer a target's frontmatter shape from its existing skills
   skillsync.py scaffold <skill> <target> [--force]    # draft a new port in the learned shape, needs manual review
 """
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -50,6 +52,16 @@ from pathlib import Path
 
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
+VENDOR_MARKERS = (
+    "anthropics/skills",
+    "trail of bits",
+    "trailofbits",
+    "openai-curated",
+    "openai bundled",
+    "source: anthropic",
+    "source: openai",
+    "source: trail",
+)
 
 
 def strip_vault_wrappers(text: str) -> str:
@@ -161,6 +173,44 @@ def stamp_content(text: str, version: str) -> str:
 def read_stamp(text: str):
     m = re.search(r"synced-from: ([0-9a-f]+)", text)
     return m.group(1) if m else None
+
+
+def has_symlink_component(path: Path, stop_at: Path) -> bool:
+    """True when path or one of its parents under stop_at is a symlink."""
+    try:
+        rel = path.relative_to(stop_at)
+    except ValueError:
+        return path.is_symlink()
+    cur = stop_at
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return True
+    return False
+
+
+def classify_runtime_skill(skill_file: Path, target_dir: Path, core_target, core_names: set) -> tuple:
+    """Return (class, note) for one runtime skill file."""
+    rel = skill_file.relative_to(target_dir)
+    parts = rel.parts
+    name = skill_file.parent.name
+    text = skill_file.read_text(errors="ignore")
+    lower = text[:5000].lower()
+
+    if any(part.startswith(".archive") or part == "archive" or part == ".archive" for part in parts):
+        return "archived", "archive path"
+
+    if core_target and skill_file.resolve() == core_target.resolve():
+        stamp = read_stamp(text)
+        return "core-port", f"stamp {stamp or 'missing'}"
+
+    if name in core_names:
+        return "local", "duplicate name of Core skill"
+
+    if re.search(r"(?m)^license:\s*proprietary", lower) or any(marker in lower for marker in VENDOR_MARKERS):
+        return "vendor", "vendor marker"
+
+    return "local", "runtime-local"
 
 
 def parse_frontmatter(text: str):
@@ -413,6 +463,167 @@ def cmd_check(args):
         sys.exit(1)
 
 
+def cmd_registry(args):
+    config = load_config()
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    core_files = find_skills(source_dir)
+    core_names = {p.stem for p in core_files}
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rows = []
+    class_counts = {}
+    runtime_counts = {}
+    duplicate_rows = []
+    symlink_rows = []
+
+    for target_name, target_raw in config["targets"].items():
+        target_dir = Path(target_raw).expanduser()
+        if not target_dir.exists():
+            row = {
+                "runtime": target_name,
+                "skill": "(target missing)",
+                "class": "unknown",
+                "path": str(target_dir),
+                "stamp": "",
+                "symlink": "",
+                "note": "target directory missing",
+            }
+            rows.append(row)
+            class_counts["unknown"] = class_counts.get("unknown", 0) + 1
+            runtime_counts[target_name] = runtime_counts.get(target_name, 0) + 1
+            continue
+
+        core_targets = {name: target_file(target_raw, name) for name in core_names}
+        seen_core_names = {}
+
+        for skill_file in sorted(target_dir.glob("**/SKILL.md")):
+            name = skill_file.parent.name
+            rel = skill_file.relative_to(target_dir)
+            core_target = core_targets.get(name)
+            cls, note = classify_runtime_skill(skill_file, target_dir, core_target, core_names)
+            stamp = read_stamp(skill_file.read_text(errors="ignore")) or ""
+            symlink = "yes" if has_symlink_component(skill_file, target_dir) else ""
+            row = {
+                "runtime": target_name,
+                "skill": name,
+                "class": cls,
+                "path": str(rel),
+                "stamp": stamp,
+                "symlink": symlink,
+                "note": note,
+            }
+            rows.append(row)
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+            runtime_counts[target_name] = runtime_counts.get(target_name, 0) + 1
+
+            if symlink:
+                symlink_rows.append(row)
+            if name in core_names:
+                seen_core_names.setdefault(name, []).append((rel, cls))
+
+        for name, matches in seen_core_names.items():
+            if len(matches) > 1:
+                duplicate_rows.append((target_name, name, matches))
+
+    rows.sort(key=lambda r: (r["runtime"], r["class"], r["skill"], r["path"]))
+
+    lines = [
+        "---",
+        "weight: 70",
+        "group: Moons",
+        "tags: [reference, stack, skill, agents]",
+        "nord_type: REFERENCE",
+        "nord_owner: NordSym",
+        "nord_status: LIVE",
+        f"updated: {generated_at[:10]}",
+        "---",
+        "",
+        "# SKILL-REGISTRY",
+        "",
+        "Generated inventory of runtime skill files tracked by `skillsync`.",
+        "",
+        f"Generated at: `{generated_at}`",
+        f"Source directory: `{config['source_dir']}`",
+        "",
+        "> Generated file. Do not hand-edit rows. Regenerate from the vault root with `python3 /Users/gustavhemmingsson/Projects/skillsync/skillsync.py registry --output '15 - Stack/Skills/SKILL-REGISTRY.md'`.",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Count |",
+        "|---|---:|",
+        f"| Runtime skill files | {len(rows)} |",
+        f"| Governed Core source skills | {len(core_names)} |",
+    ]
+    for cls in sorted(class_counts):
+        lines.append(f"| `{cls}` rows | {class_counts[cls]} |")
+
+    lines += [
+        "",
+        "## Runtime Counts",
+        "",
+        "| Runtime | Rows |",
+        "|---|---:|",
+    ]
+    for runtime in sorted(runtime_counts):
+        lines.append(f"| `{runtime}` | {runtime_counts[runtime]} |")
+
+    lines += [
+        "",
+        "## Duplicate Core Names",
+        "",
+    ]
+    if duplicate_rows:
+        lines += ["| Runtime | Skill | Paths |", "|---|---|---|"]
+        for runtime, name, matches in duplicate_rows:
+            paths = "<br>".join(f"`{rel}` ({cls})" for rel, cls in matches)
+            lines.append(f"| `{runtime}` | `{name}` | {paths} |")
+    else:
+        lines.append("None.")
+
+    lines += [
+        "",
+        "## Symlink Rows",
+        "",
+    ]
+    if symlink_rows:
+        lines += ["| Runtime | Skill | Path | Class |", "|---|---|---|---|"]
+        for row in symlink_rows:
+            lines.append(f"| `{row['runtime']}` | `{row['skill']}` | `{row['path']}` | `{row['class']}` |")
+    else:
+        lines.append("None.")
+
+    lines += [
+        "",
+        "## Inventory",
+        "",
+        "| Runtime | Skill | Class | Path | Stamp | Symlink | Note |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| `{row['runtime']}` | `{row['skill']}` | `{row['class']}` | "
+            f"`{row['path']}` | `{row['stamp']}` | `{row['symlink']}` | {row['note']} |"
+        )
+
+    lines += [
+        "",
+        "---",
+        "Up: [[15 - Stack/Skills/SKILL-MOC|Skill MoC]]",
+        "",
+        "#Moon #Stack #Skill",
+        "",
+    ]
+
+    output = "\n".join(lines)
+    if args.output:
+        out_path = Path(args.output).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output)
+        print(f"Wrote {out_path}")
+    else:
+        print(output)
+
+
 def send_webhook(config, missing, missing_list, stale, stale_list):
     """POSTs a JSON body to config['webhook_url']. Works unmodified against
     Slack/Discord/Mattermost-style incoming webhooks (a {"text": "..."} body
@@ -508,6 +719,9 @@ def main():
     p_check.add_argument("--webhook", action="store_true", help="POST to webhook_url on real drift")
     p_check.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
 
+    p_registry = sub.add_parser("registry", help="emit a generated inventory of all target skills")
+    p_registry.add_argument("--output", help="write markdown to this path instead of stdout")
+
     sub.add_parser("install-hook", help="install a git post-commit hook in the source repo")
 
     p_learn = sub.add_parser("learn-format", help="infer a target's frontmatter shape from its existing skills")
@@ -529,6 +743,7 @@ def main():
         "init": cmd_init,
         "stamp": cmd_stamp,
         "check": cmd_check,
+        "registry": cmd_registry,
         "install-hook": cmd_install_hook,
         "learn-format": cmd_learn_format,
         "scaffold": cmd_scaffold,
