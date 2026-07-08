@@ -106,8 +106,16 @@ def write_config(config):
     (Path.cwd() / CONFIG_FILE).write_text(json.dumps(config, indent=2) + "\n")
 
 
-def is_git_repo(path: Path) -> bool:
-    return (path / ".git").exists()
+def git_root(path: Path):
+    out = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=path,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        return None
+    return Path(out.stdout.strip())
 
 
 def source_version(source_dir: Path, skill_file: Path) -> str:
@@ -116,10 +124,11 @@ def source_version(source_dir: Path, skill_file: Path) -> str:
     (so it survives renames within the same content), otherwise a content
     hash so the tool still works on a plain, non-git folder of skills.
     """
-    if is_git_repo(source_dir):
+    root = git_root(source_dir)
+    if root:
         out = subprocess.run(
             ["git", "log", "-1", "--format=%h", "--", str(skill_file)],
-            cwd=source_dir,
+            cwd=root,
             capture_output=True,
             text=True,
         )

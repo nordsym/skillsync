@@ -42,9 +42,9 @@ nothing to do with content.
 
 `skillsync` compares **versions**, not clocks:
 
-- If the source directory is a git repo, it uses `git log -1` on the specific
-  file, a real content-change signal that only moves on an actual commit
-  touching that file.
+- If the source directory is inside a git repo, it uses `git log -1` on the
+  specific file, a real content-change signal that only moves on an actual
+  commit touching that file.
 - If the source isn't a git repo, it falls back to a content hash, so the
   tool still works on a plain folder with no version control.
 
