@@ -31,6 +31,10 @@ does mechanically:
    from the skills already there, and scaffolds a draft in that shape for a
    new port. Never auto-stamped, a scaffold is a starting point for a human
    or agent to actually adapt, not a finished translation.
+7. Produces a read-only upstream proposal when a runtime-local skill has
+   learned something worth reviewing for canonical source. It normalizes
+   wrappers, shows a unified diff, detects two-sided conflicts when a stamped
+   git base is available, and never writes to the source or runtime port.
 
 ## Why this doesn't produce false alarms
 
@@ -91,6 +95,9 @@ chmod +x skillsync.py
 # drafts a new port in the learned shape, placed at the right path,
 # pre-filled with fixed fields and the raw source content -- never
 # auto-stamped, review and rewrite the prose before 'stamp'
+
+./skillsync.py propose-upstream <skill-name> --target <target-name>
+# prints a read-only, classified runtime-to-source diff for review
 ```
 
 ## Config (`skillsync.json`)
@@ -141,6 +148,26 @@ duplicate names that could mask a governed port.
 ```
 
 Use this when the problem is catalog visibility rather than drift.
+
+## Upstream proposals
+
+Runtime agents sometimes improve their local copy of a skill. Do not copy that
+file over canonical source or silently distribute it to every runtime. Generate
+a proposal instead:
+
+```bash
+./skillsync.py propose-upstream nordsym-state --target hermes
+./skillsync.py propose-upstream nordsym-state --target hermes --output /tmp/nordsym-state-upstream.diff
+```
+
+The command strips source-only wrappers and the sync marker before comparison.
+If the runtime stamp points to an available git commit, it uses that version as
+the merge base. `CONFLICT` means both source and runtime changed since that base.
+`CORE_CANDIDATE` means the runtime contains a substantive candidate change, not
+that the change has been approved for Core. `RUNTIME_ONLY` means the runtime did
+not diverge from its base while canonical source moved. `NO_CHANGE` means the
+normalized bodies match. The command performs no writes unless `--output` is
+explicitly supplied, and that write contains only the report.
 
 ## Why this doesn't auto-generate the full port
 

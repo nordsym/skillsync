@@ -39,8 +39,11 @@ Usage:
   skillsync.py install-hook                           # add a post-commit hook to the source repo (git sources only)
   skillsync.py learn-format [<target>] [--all]        # infer a target's frontmatter shape from its existing skills
   skillsync.py scaffold <skill> <target> [--force]    # draft a new port in the learned shape, needs manual review
+  skillsync.py propose-upstream <skill> --target <target> [--output <path>]
+                                                        # read-only runtime-to-source proposal
 """
 import argparse
+import difflib
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -182,6 +185,99 @@ def stamp_content(text: str, version: str) -> str:
 def read_stamp(text: str):
     m = re.search(r"synced-from: ([0-9a-f]+)", text)
     return m.group(1) if m else None
+
+
+def normalized_skill_body(text: str) -> str:
+    """Return the comparable body shared by source and runtime ports."""
+    return strip_vault_wrappers(text).replace("\r\n", "\n")
+
+
+def source_body_at_version(source_dir: Path, skill_file: Path, version: str):
+    """Read a source skill at a stamped git version, or return None."""
+    root = git_root(source_dir)
+    if not root or not re.fullmatch(r"[0-9a-f]{7,40}", version or ""):
+        return None
+    try:
+        rel = skill_file.relative_to(root)
+    except ValueError:
+        return None
+    out = subprocess.run(
+        ["git", "show", f"{version}:{rel.as_posix()}"], cwd=root,
+        capture_output=True, text=True,
+    )
+    return normalized_skill_body(out.stdout) if out.returncode == 0 else None
+
+
+def classify_upstream_proposal(source_body: str, runtime_body: str, base_body=None):
+    """Classify a read-only runtime-to-source proposal."""
+    if source_body == runtime_body:
+        return "NO_CHANGE"
+    if base_body is None:
+        return "CORE_CANDIDATE"
+    source_changed = source_body != base_body
+    runtime_changed = runtime_body != base_body
+    if source_changed and runtime_changed:
+        return "CONFLICT"
+    if runtime_changed:
+        return "CORE_CANDIDATE"
+    return "RUNTIME_ONLY"
+
+
+def cmd_propose_upstream(args):
+    config = load_config()
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.skill):
+        sys.exit("Skill name must be a simple filename stem with no path separators")
+    source_file = source_dir / f"{args.skill}.md"
+    if not source_file.exists():
+        sys.exit(f"No canonical Core skill named '{args.skill}' in {source_dir}")
+    if args.target not in config["targets"]:
+        sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
+    runtime_file = target_file(config["targets"][args.target], args.skill)
+    if not runtime_file.exists():
+        sys.exit(f"No runtime port for '{args.skill}' in target '{args.target}'")
+
+    runtime_raw = runtime_file.read_text()
+    source_body = normalized_skill_body(source_file.read_text())
+    runtime_body = normalized_skill_body(runtime_raw)
+    stamp = read_stamp(runtime_raw)
+    base_body = source_body_at_version(source_dir, source_file, stamp) if stamp else None
+    classification = classify_upstream_proposal(source_body, runtime_body, base_body)
+    diff = "".join(difflib.unified_diff(
+        source_body.splitlines(keepends=True), runtime_body.splitlines(keepends=True),
+        fromfile=f"canonical/{args.skill}.md",
+        tofile=f"{args.target}/{args.skill}/SKILL.md",
+    ))
+    report = "\n".join([
+        "skillsync upstream proposal",
+        f"Classification: {classification}",
+        f"Skill: {args.skill}",
+        f"Target: {args.target}",
+        f"Canonical: {source_file}",
+        f"Runtime: {runtime_file}",
+        f"Runtime stamp: {stamp or 'UNSTAMPED'}",
+        f"Historical base: {'available' if base_body is not None else 'unavailable'}",
+        "", "This is read-only. Review the diff and patch canonical Core deliberately.",
+        "", diff or "(no semantic body diff)\n",
+    ])
+    if args.output:
+        output = Path(args.output).expanduser()
+        if output.is_symlink():
+            sys.exit("Refusing to write an upstream report through a symlink")
+        resolved_output = output.resolve()
+        protected_roots = [source_dir] + [Path(p).expanduser().resolve() for p in config["targets"].values()]
+        if resolved_output == source_file.resolve() or resolved_output == runtime_file.resolve():
+            sys.exit("Refusing to overwrite canonical source or runtime port with a report")
+        if any(root == resolved_output or root in resolved_output.parents for root in protected_roots):
+            sys.exit("Refusing to write an upstream report inside a source or target skill tree")
+        if any(part == ".git" for part in resolved_output.parts):
+            sys.exit("Refusing to write an upstream report inside .git")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report)
+        print(f"Wrote {output}")
+        print(f"Classification: {classification}")
+    else:
+        print(report, end="" if report.endswith("\n") else "\n")
 
 
 def has_symlink_component(path: Path, stop_at: Path) -> bool:
@@ -742,6 +838,12 @@ def main():
     p_scaffold.add_argument("target", help="target name")
     p_scaffold.add_argument("--force", action="store_true", help="overwrite an existing draft")
 
+    p_upstream = sub.add_parser("propose-upstream", help="show a read-only runtime-to-Core proposal")
+    p_upstream.add_argument("skill", help="canonical Core skill name")
+    p_upstream.add_argument("--target", required=True, help="runtime target containing the local improvement")
+    p_upstream.add_argument("--output", help="write the proposal report to a local file")
+    p_upstream.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
     args = parser.parse_args()
 
     global CONFIG_FILE
@@ -756,6 +858,7 @@ def main():
         "install-hook": cmd_install_hook,
         "learn-format": cmd_learn_format,
         "scaffold": cmd_scaffold,
+        "propose-upstream": cmd_propose_upstream,
     }[args.command](args)
 
 
