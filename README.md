@@ -73,6 +73,10 @@ chmod +x skillsync.py
 ./skillsync.py stamp --all
 # marks every currently-synced port as up to date
 
+./skillsync.py sync-exact --all
+# propagates canonical bodies only when each runtime still matches its stamped
+# base; refuses runtime-local divergence instead of overwriting it
+
 ./skillsync.py check
 # OK / MISSING / STALE per skill per target
 
@@ -98,6 +102,9 @@ chmod +x skillsync.py
 
 ./skillsync.py propose-upstream <skill-name> --target <target-name>
 # prints a read-only, classified runtime-to-source diff for review
+
+./skillsync.py sync-exact <skill-name> --reviewed
+# after reviewing a refused port, explicitly accept canonical Core for it
 ```
 
 ## Config (`skillsync.json`)
@@ -134,6 +141,13 @@ chmod +x skillsync.py
 4. Commit the source. If you installed the hook, any future edit that
    doesn't get re-stamped will surface automatically on the next commit,
    not silently.
+
+For agent-agnostic Core skills whose runtime ports are intended to be exact,
+use `sync-exact` after the source commit. It verifies that each runtime still
+matches the body at its existing stamp before replacing it. If a runtime has
+learned something locally, the command refuses that port. Review it with
+`propose-upstream`, promote any useful learning into Core, then rerun with
+`--reviewed` only when choosing canonical Core deliberately.
 
 ## Registry
 

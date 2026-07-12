@@ -34,6 +34,8 @@ Zero dependencies beyond the Python 3.9+ standard library.
 Usage:
   skillsync.py init                                  # write skillsync.json in the current dir
   skillsync.py stamp [<skill>] [--all]                # mark port(s) as synced to the current source version
+  skillsync.py sync-exact [<skill>] [--all] [--reviewed]
+                                                        # propagate canonical body with divergence guard
   skillsync.py check [<skill>] [--fail-on-drift] [--webhook]
   skillsync.py registry [--output <path>]             # emit a generated inventory of all target skills
   skillsync.py install-hook                           # add a post-commit hook to the source repo (git sources only)
@@ -519,6 +521,60 @@ def cmd_stamp(args):
             print(f"STAMPED  {target_name}:{name} -> {version}")
 
 
+def cmd_sync_exact(args):
+    """Propagate the exact canonical body to managed runtime ports.
+
+    A port is safe to update automatically only when its current normalized
+    body still matches the source body at its stamp. Diverged or unstamped
+    ports require an explicit --reviewed acknowledgement after
+    propose-upstream has been inspected.
+    """
+    config = load_config()
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    skills = find_skills(source_dir)
+    if not args.all:
+        skills = [s for s in skills if s.stem == args.skill]
+        if not skills:
+            sys.exit(f"No skill named '{args.skill}' in {source_dir}")
+
+    refused = 0
+    synced = 0
+    for skill_file in skills:
+        name = skill_file.stem
+        version = source_version(source_dir, skill_file)
+        canonical = stamp_content(skill_file.read_text(), version)
+        for target_name, target_dir in config["targets"].items():
+            dest = target_file(target_dir, name)
+            if not dest.exists():
+                print(f"MISSING  {target_name}:{name}")
+                refused += 1
+                continue
+
+            runtime_text = dest.read_text()
+            stamp = read_stamp(runtime_text)
+            base_body = source_body_at_version(source_dir, skill_file, stamp) if stamp else None
+            unchanged_from_base = (
+                base_body is not None
+                and normalized_skill_body(runtime_text) == base_body
+            )
+            if not unchanged_from_base and not args.reviewed:
+                print(
+                    f"REFUSED  {target_name}:{name} "
+                    "(runtime diverged or is unstamped; review with propose-upstream, then rerun with --reviewed)"
+                )
+                refused += 1
+                continue
+
+            dest.write_text(canonical)
+            mode = "reviewed" if not unchanged_from_base else "exact-base"
+            print(f"SYNCED   {target_name}:{name} -> {version} ({mode})")
+            synced += 1
+
+    print(f"\nSummary: SYNCED: {synced}   REFUSED/MISSING: {refused}")
+    if refused:
+        sys.exit(1)
+
+
 def cmd_check(args):
     config = load_config()
     source_dir = Path(config["source_dir"]).expanduser().resolve()
@@ -818,6 +874,11 @@ def main():
     p_stamp.add_argument("skill", nargs="?", help="skill name (omit with --all)")
     p_stamp.add_argument("--all", action="store_true", help="stamp every skill")
 
+    p_sync = sub.add_parser("sync-exact", help="propagate canonical bodies without overwriting unreviewed runtime divergence")
+    p_sync.add_argument("skill", nargs="?", help="skill name (omit with --all)")
+    p_sync.add_argument("--all", action="store_true", help="sync every skill")
+    p_sync.add_argument("--reviewed", action="store_true", help="allow overwrite of diverged or unstamped ports after propose-upstream review")
+
     p_check = sub.add_parser("check", help="report missing/stale ports")
     p_check.add_argument("skill", nargs="?", help="check only this skill")
     p_check.add_argument("--fail-on-drift", action="store_true", help="exit 1 if anything is out of sync")
@@ -853,6 +914,7 @@ def main():
     {
         "init": cmd_init,
         "stamp": cmd_stamp,
+        "sync-exact": cmd_sync_exact,
         "check": cmd_check,
         "registry": cmd_registry,
         "install-hook": cmd_install_hook,
