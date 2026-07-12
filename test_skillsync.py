@@ -128,5 +128,23 @@ class SyncExactTests(unittest.TestCase):
         self.assertEqual(skillsync.normalized_skill_body(port.read_text()), "# Demo\n\nVersion two.\n")
 
 
+class PublicCliContractTests(unittest.TestCase):
+    def test_version_matches_release_line(self):
+        self.assertEqual(skillsync.__version__, "0.3.0")
+
+    def test_readme_commands_exist_in_cli_help(self):
+        readme = Path(__file__).with_name("README.md").read_text()
+        documented = set()
+        for match in __import__("re").finditer(r"(?m)^\s*(?:\./|python3?\s+)?skillsync\.py\s+([a-z][a-z-]+)", readme):
+            documented.add(match.group(1))
+        result = subprocess.run(
+            [__import__("sys").executable, str(Path(__file__).with_name("skillsync.py")), "--help"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for command in documented:
+            self.assertIn(command, result.stdout)
+
 if __name__ == "__main__":
     unittest.main()

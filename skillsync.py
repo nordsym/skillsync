@@ -55,6 +55,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+__version__ = "0.3.0"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 VENDOR_MARKERS = (
@@ -866,6 +867,7 @@ def cmd_install_hook(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"skillsync {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="write a starter skillsync.json in the current directory")
