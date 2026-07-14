@@ -145,6 +145,25 @@ def source_version(source_dir: Path, skill_file: Path) -> str:
     return hashlib.sha256(skill_file.read_bytes()).hexdigest()[:8]
 
 
+def versions_match(source_dir: Path, stamped: str, current: str) -> bool:
+    """Compare Git abbreviations by commit identity, not abbreviation length."""
+    if stamped == current:
+        return True
+    if not re.fullmatch(r"[0-9a-f]{7,40}", stamped or "") or not re.fullmatch(r"[0-9a-f]{7,40}", current or ""):
+        return False
+    root = git_root(source_dir)
+    if not root:
+        return False
+    out = subprocess.run(
+        ["git", "rev-parse", f"{stamped}^{{commit}}", f"{current}^{{commit}}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    resolved = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    return out.returncode == 0 and len(resolved) == 2 and resolved[0] == resolved[1]
+
+
 def find_skills(source_dir: Path):
     return sorted(p for p in source_dir.glob("*.md") if p.is_file())
 
@@ -607,7 +626,7 @@ def cmd_check(args):
                 print(f"UNSTAMPED {target_name}:{name} (never stamped -- run 'skillsync.py stamp')")
                 stale_list.append(f"{target_name}:{name} (unstamped)")
                 stale += 1
-            elif stamped != current:
+            elif not versions_match(source_dir, stamped, current):
                 print(f"STALE    {target_name}:{name} (stamped {stamped}, source now {current})")
                 stale_list.append(f"{target_name}:{name} (source moved to {current})")
                 stale += 1

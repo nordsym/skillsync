@@ -178,5 +178,24 @@ class WebhookCredentialTests(unittest.TestCase):
             "https://example.test/hook",
         )
 
+
+class VersionMatchTests(unittest.TestCase):
+    def test_git_abbreviations_of_same_commit_match(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "skillsync test"], cwd=root, check=True)
+            (root / "skill.md").write_text("one\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "one"], cwd=root, check=True)
+            first = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertTrue(skillsync.versions_match(root, first[:7], first[:8]))
+
+            (root / "skill.md").write_text("two\n")
+            subprocess.run(["git", "commit", "-qam", "two"], cwd=root, check=True)
+            second = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertFalse(skillsync.versions_match(root, first[:7], second[:8]))
+
 if __name__ == "__main__":
     unittest.main()
