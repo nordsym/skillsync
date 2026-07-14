@@ -52,10 +52,11 @@ import json
 import re
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 VENDOR_MARKERS = (
@@ -786,6 +787,39 @@ def cmd_registry(args):
         print(output)
 
 
+def resolve_webhook_url(config):
+    """Resolve an optional URL secret from macOS Keychain without persisting it."""
+    url = config["webhook_url"]
+    keychain = config.get("webhook_keychain")
+    if "{secret}" not in url:
+        if keychain:
+            raise RuntimeError("webhook_keychain requires a {secret} placeholder")
+        return url
+    if not isinstance(keychain, dict) or not keychain.get("service") or not keychain.get("account"):
+        raise RuntimeError("webhook {secret} placeholder requires service and account")
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                keychain["service"],
+                "-a",
+                keychain["account"],
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("webhook Keychain lookup failed") from exc
+    secret = result.stdout.strip()
+    if result.returncode != 0 or not secret:
+        raise RuntimeError("webhook credential unavailable in Keychain")
+    return url.replace("{secret}", urllib.parse.quote(secret, safe=":-._~"))
+
+
 def send_webhook(config, missing, missing_list, stale, stale_list):
     """POSTs a JSON body to config['webhook_url']. Works unmodified against
     Slack/Discord/Mattermost-style incoming webhooks (a {"text": "..."} body
@@ -810,11 +844,11 @@ def send_webhook(config, missing, missing_list, stale, stale_list):
     payload = dict(config.get("webhook_extra", {}))
     payload[field] = "\n".join(lines)
 
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        config["webhook_url"], data=body, headers={"Content-Type": "application/json"}
-    )
     try:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            resolve_webhook_url(config), data=body, headers={"Content-Type": "application/json"}
+        )
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"(webhook post failed: {e})", file=sys.stderr)

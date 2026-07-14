@@ -130,7 +130,7 @@ class SyncExactTests(unittest.TestCase):
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.3.0")
+        self.assertEqual(skillsync.__version__, "0.3.1")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
@@ -145,6 +145,38 @@ class PublicCliContractTests(unittest.TestCase):
         )
         for command in documented:
             self.assertIn(command, result.stdout)
+
+
+class WebhookCredentialTests(unittest.TestCase):
+    def test_resolves_keychain_secret_only_in_memory(self):
+        config = {
+            "webhook_url": "https://example.test/bot{secret}/send",
+            "webhook_keychain": {"service": "alerts", "account": "operator"},
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout="123:abc_DEF\n", stderr="")
+        with patch.object(skillsync.subprocess, "run", return_value=completed) as run:
+            url = skillsync.resolve_webhook_url(config)
+        self.assertEqual(url, "https://example.test/bot123:abc_DEF/send")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["security", "find-generic-password", "-s", "alerts", "-a", "operator", "-w"],
+        )
+
+    def test_missing_keychain_secret_fails_closed(self):
+        config = {
+            "webhook_url": "https://example.test/bot{secret}/send",
+            "webhook_keychain": {"service": "alerts", "account": "operator"},
+        }
+        completed = subprocess.CompletedProcess([], 44, stdout="", stderr="not found")
+        with patch.object(skillsync.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                skillsync.resolve_webhook_url(config)
+
+    def test_plain_webhook_url_remains_supported(self):
+        self.assertEqual(
+            skillsync.resolve_webhook_url({"webhook_url": "https://example.test/hook"}),
+            "https://example.test/hook",
+        )
 
 if __name__ == "__main__":
     unittest.main()

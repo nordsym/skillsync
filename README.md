@@ -117,7 +117,8 @@ chmod +x skillsync.py
     "codex": "~/.codex/skills",
     "agents": "~/.agents/skills"
   },
-  "webhook_url": null
+  "webhook_url": null,
+  "webhook_keychain": null
 }
 ```
 
@@ -130,6 +131,9 @@ chmod +x skillsync.py
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.
+- `webhook_keychain`: optional macOS Keychain reference with `service` and
+  `account`. Put `{secret}` in `webhook_url`; skillsync resolves it only in
+  memory and fails closed when the credential is unavailable.
 
 ## Typical workflow
 
