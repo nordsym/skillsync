@@ -18,8 +18,9 @@ does mechanically:
 1. Tracks one canonical **source directory** for your skill files.
 2. Stamps each ported copy with a marker recording exactly which version of
    the source it reflects.
-3. Compares stamps against the source's *current* version and reports which
-   ports are **missing** or **out of date**.
+3. Compares stamps and normalized bodies against the source's *current*
+   version and reports ports that are **missing**, **out of date**, or
+   **semantically diverged**. A current stamp alone is never a green claim.
 4. Strips source-only vault wrappers when stamping a port: leading YAML or
    preamble before the first H1, plus trailing Obsidian `Up:`/hashtag footers.
    Runtime ports keep the skill body, not the source repo's navigation
