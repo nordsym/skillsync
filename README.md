@@ -26,12 +26,15 @@ does mechanically:
    metadata.
 5. Optionally fires a webhook when real drift is found, and optionally
    installs a git hook so drift is caught the moment the source changes.
-6. Learns each target's frontmatter *shape* (fields, whether it uses
+6. Renders exact Core ports with portable `name` and `description`
+   frontmatter at byte zero, plus a source-version marker. It never generates
+   or rewrites instruction prose.
+7. Learns each target's frontmatter *shape* (fields, whether it uses
    frontmatter at all, whether skills live flat or under a category folder)
    from the skills already there, and scaffolds a draft in that shape for a
    new port. Never auto-stamped, a scaffold is a starting point for a human
    or agent to actually adapt, not a finished translation.
-7. Produces a read-only upstream proposal when a runtime-local skill has
+8. Produces a read-only upstream proposal when a runtime-local skill has
    learned something worth reviewing for canonical source. It normalizes
    wrappers, shows a unified diff, detects two-sided conflicts when a stamped
    git base is available, and never writes to the source or runtime port.
@@ -77,6 +80,10 @@ chmod +x skillsync.py
 # propagates canonical bodies only when each runtime still matches its stamped
 # base; refuses runtime-local divergence instead of overwriting it
 
+./skillsync.py sync-exact --all --reviewed --create-missing
+# explicit managed-Core rollout after reviewing divergence. It creates only
+# missing ports in a configured managed root.
+
 ./skillsync.py check
 # OK / MISSING / STALE per skill per target
 
@@ -103,6 +110,14 @@ chmod +x skillsync.py
 ./skillsync.py propose-upstream <skill-name> --target <target-name>
 # prints a read-only, classified runtime-to-source diff for review
 
+./skillsync.py promote-candidate <target-name> <local-skill-name> --output /tmp/candidate.json
+# emits provenance and risk flags for a local skill. It never copies, enables,
+# or promotes it.
+
+./skillsync.py capability-snapshot --output /tmp/core-port-parity.json
+# emits managed port parity. Native discovery stays explicitly unobserved until
+# each runtime's own loader acceptance has run.
+
 ./skillsync.py sync-exact <skill-name> --reviewed
 # after reviewing a refused port, explicitly accept canonical Core for it
 ```
@@ -117,6 +132,9 @@ chmod +x skillsync.py
     "codex": "~/.codex/skills",
     "agents": "~/.agents/skills"
   },
+  "managed_roots": {
+    "hermes": "~/.hermes/skills/nordsym"
+  },
   "webhook_url": null,
   "webhook_keychain": null
 }
@@ -128,6 +146,9 @@ chmod +x skillsync.py
   (`<target_dir>/<skill_name>/SKILL.md`, what Claude Code, Codex, and
   OpenClaw use) and categorized layouts (`<target_dir>/<category>/<skill_name>/SKILL.md`,
   what Hermes uses) work without extra configuration.
+- `managed_roots`: optional per-runtime dedicated landing zones for governed
+  Core. Use this when a runtime has self-evolved skills that must never be
+  mistaken for or overwritten as a Core port.
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.
@@ -152,6 +173,18 @@ matches the body at its existing stamp before replacing it. If a runtime has
 learned something locally, the command refuses that port. Review it with
 `propose-upstream`, promote any useful learning into Core, then rerun with
 `--reviewed` only when choosing canonical Core deliberately.
+
+## Managed Core and local evolution
+
+Runtime-local, vendor, experimental, and client-bound skills are not portable
+just because they sit in one harness. A `managed_roots` entry keeps governed
+Core separate from local evolution. `sync-exact --create-missing` writes only
+there and never overwrites a same-named local skill.
+
+Use `promote-candidate` to create a read-only provenance/risk packet for a
+local skill. Promotion still requires an explicit Core review, chosen target
+allowlist, and native-loader acceptance. A visible Core skill never grants
+tools, credentials, identity, client access, or execution authority.
 
 ## Registry
 
