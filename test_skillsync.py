@@ -219,6 +219,21 @@ class SyncExactTests(unittest.TestCase):
         finally:
             os.chdir(previous)
 
+    def test_check_detects_current_stamp_with_semantic_divergence(self):
+        port = self.target / "demo" / "SKILL.md"
+        port.write_text(port.read_text() + "Runtime-only instruction.\n")
+        args = SimpleNamespace(skill=None, fail_on_drift=True, webhook=False)
+        previous = Path.cwd()
+        output = io.StringIO()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(output), self.assertRaises(SystemExit):
+                skillsync.cmd_check(args)
+        finally:
+            os.chdir(previous)
+        self.assertIn("DIVERGED test:demo", output.getvalue())
+        self.assertIn("DIVERGED: 1", output.getvalue())
+
 
 class PromotionAndSnapshotTests(unittest.TestCase):
     def setUp(self):
@@ -273,6 +288,24 @@ class PromotionAndSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["schema"], "skillsync-capability-snapshot/v1")
         self.assertEqual(snapshot["semantics"]["native_discovery"], "not_observed")
         self.assertEqual(snapshot["skills"][0]["ports"][0]["native_discovery"], "not_observed")
+
+    def test_capability_snapshot_requires_body_as_well_as_version_parity(self):
+        managed = self.target / "nordsym" / "demo" / "SKILL.md"
+        managed.parent.mkdir(parents=True)
+        version = skillsync.source_version(self.source, self.source / "demo.md")
+        managed.write_text(skillsync.render_core_port("demo", (self.source / "demo.md").read_text(), version) + "Local addendum.\n")
+        args = SimpleNamespace(output=str(self.root / "snapshot.json"))
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_capability_snapshot(args)
+        finally:
+            os.chdir(previous)
+        port = json.loads((self.root / "snapshot.json").read_text())["skills"][0]["ports"][0]
+        self.assertTrue(port["version_parity"])
+        self.assertFalse(port["body_parity"])
+        self.assertFalse(port["parity"])
 
 
 class PublicCliContractTests(unittest.TestCase):

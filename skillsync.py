@@ -16,8 +16,9 @@ What it does mechanically:
   2. Stamp each ported copy with a marker recording which version of the
      source it reflects (a git commit SHA if the source is a git repo,
      otherwise a content hash -- works either way).
-  3. Compare stamps against the source's *current* version and report which
-     ports are missing or out of date. This is a real-content comparison,
+  3. Compare stamps and normalized bodies against the source's *current*
+     version and report ports that are missing, stale, or semantically
+     diverged. This is a real-content comparison,
      not a file-timestamp comparison -- moving, cloning, or checking out the
      source repo can never produce a false positive.
   4. Optionally fire a webhook when real drift is found, and optionally
@@ -475,7 +476,7 @@ def cmd_capability_snapshot(args):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source_dir": str(source_dir),
         "semantics": {
-            "port_parity": "A current managed Core file exists and matches its canonical source version.",
+            "port_parity": "A current managed Core file exists and matches canonical source version and normalized body.",
             "native_discovery": "not_observed",
             "authority": "A visible skill grants no tools, identity, credential, client, or execution authority.",
         },
@@ -494,7 +495,9 @@ def cmd_capability_snapshot(args):
                 "path": str(path),
                 "exists": path.exists(),
                 "source_version": stamp or None,
-                "parity": bool(stamp and versions_match(source_dir, stamp, version)),
+                "version_parity": bool(stamp and versions_match(source_dir, stamp, version)),
+                "body_parity": bool(path.exists() and normalized_skill_body(text) == normalized_skill_body(skill_file.read_text())),
+                "parity": bool(stamp and versions_match(source_dir, stamp, version) and normalized_skill_body(text) == normalized_skill_body(skill_file.read_text())),
                 "frontmatter": bool(has_frontmatter and fields.get("name") == skill_file.stem and fields.get("description")),
                 "native_discovery": "not_observed",
             })
@@ -845,8 +848,8 @@ def cmd_check(args):
         if not skills:
             sys.exit(f"No skill named '{args.skill}' in {source_dir}")
 
-    missing, stale, ok = 0, 0, 0
-    missing_list, stale_list = [], []
+    missing, stale, diverged, ok = 0, 0, 0, 0
+    missing_list, stale_list, diverged_list = [], [], []
 
     print("skillsync check")
     print(f"Source: {source_dir}\n")
@@ -854,6 +857,7 @@ def cmd_check(args):
     for skill_file in skills:
         name = skill_file.stem
         current = source_version(source_dir, skill_file)
+        source_body = normalized_skill_body(skill_file.read_text())
         for target_name, target_dir in config["targets"].items():
             dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
@@ -861,7 +865,8 @@ def cmd_check(args):
                 missing_list.append(f"{target_name}:{name}")
                 missing += 1
                 continue
-            stamped = read_stamp(dest.read_text())
+            runtime_text = dest.read_text()
+            stamped = read_stamp(runtime_text)
             if stamped is None:
                 print(f"UNSTAMPED {target_name}:{name} (never stamped -- run 'skillsync.py stamp')")
                 stale_list.append(f"{target_name}:{name} (unstamped)")
@@ -870,18 +875,22 @@ def cmd_check(args):
                 print(f"STALE    {target_name}:{name} (stamped {stamped}, source now {current})")
                 stale_list.append(f"{target_name}:{name} (source moved to {current})")
                 stale += 1
+            elif normalized_skill_body(runtime_text) != source_body:
+                print(f"DIVERGED {target_name}:{name} (stamp is current but normalized body differs)")
+                diverged_list.append(f"{target_name}:{name} (stamp {stamped}, body differs)")
+                diverged += 1
             else:
                 ok += 1
 
     total = len(skills)
     n_targets = len(config["targets"])
     print(f"\nSummary: {total} skill(s) x {n_targets} target(s) = {total * n_targets} expected ports.")
-    print(f"OK: {ok}   MISSING: {missing}   STALE: {stale}")
+    print(f"OK: {ok}   MISSING: {missing}   STALE: {stale}   DIVERGED: {diverged}")
 
-    if (missing or stale) and args.webhook and config.get("webhook_url"):
-        send_webhook(config, missing, missing_list, stale, stale_list)
+    if (missing or stale or diverged) and args.webhook and config.get("webhook_url"):
+        send_webhook(config, missing, missing_list, stale, stale_list, diverged, diverged_list)
 
-    if args.fail_on_drift and (missing or stale):
+    if args.fail_on_drift and (missing or stale or diverged):
         sys.exit(1)
 
 
@@ -1079,7 +1088,7 @@ def resolve_webhook_url(config):
     return url.replace("{secret}", urllib.parse.quote(secret, safe=":-._~"))
 
 
-def send_webhook(config, missing, missing_list, stale, stale_list):
+def send_webhook(config, missing, missing_list, stale, stale_list, diverged=0, diverged_list=None):
     """POSTs a JSON body to config['webhook_url']. Works unmodified against
     Slack/Discord/Mattermost-style incoming webhooks (a {"text": "..."} body
     is enough for most of them). Services that need extra fixed fields in the
@@ -1098,6 +1107,10 @@ def send_webhook(config, missing, missing_list, stale, stale_list):
     if stale:
         lines.append(f"Stale ({stale}):")
         lines += [f"- {s}" for s in stale_list]
+    if diverged:
+        lines.append("")
+        lines.append(f"Diverged ({diverged}):")
+        lines += [f"- {d}" for d in (diverged_list or [])]
 
     field = config.get("webhook_field", "text")
     payload = dict(config.get("webhook_extra", {}))
