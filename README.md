@@ -118,6 +118,10 @@ chmod +x skillsync.py
 # emits managed port parity. Native discovery stays explicitly unobserved until
 # each runtime's own loader acceptance has run.
 
+./skillsync.py prepare-discovery <skill-name> --target hermes --reviewed
+# adds standard native-loader metadata to a reviewed local adaptation without
+# stamping it as canonical. Drift remains visible until semantic reconciliation.
+
 ./skillsync.py sync-exact <skill-name> --reviewed
 # after reviewing a refused port, explicitly accept canonical Core for it
 ```
@@ -185,6 +189,11 @@ Use `promote-candidate` to create a read-only provenance/risk packet for a
 local skill. Promotion still requires an explicit Core review, chosen target
 allowlist, and native-loader acceptance. A visible Core skill never grants
 tools, credentials, identity, client access, or execution authority.
+
+For a reviewed local adaptation that needs native discovery before its semantic
+promotion is decided, `prepare-discovery` may add only the standard `name` and
+`description` header. It never adds a source stamp, so `check` remains truthful
+about the unresolved semantic drift.
 
 ## Registry
 
