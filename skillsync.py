@@ -281,6 +281,29 @@ def render_discovery_port(skill_name: str, runtime_text: str) -> str:
     return header + runtime_text.lstrip("\n")
 
 
+def render_openai_yaml(skill_name: str, source_text: str) -> str:
+    """Render the minimal Codex UI adapter with no dependencies or grants."""
+    title, _description = parse_source_skill(source_text)
+    title = re.sub(r"\s*\(Core\)\s*$", "", title).strip() or skill_name
+    short = safe_description(source_text, skill_name)[:64].rstrip(" ,;:.-")
+    return "\n".join([
+        "interface:",
+        f"  display_name: {json.dumps(title, ensure_ascii=False)}",
+        f"  short_description: {json.dumps(short, ensure_ascii=False)}",
+        f"  default_prompt: {json.dumps(f'Use ${skill_name} to apply this NordSym Core skill.', ensure_ascii=False)}",
+        "",
+    ])
+
+
+def write_target_adapters(config: dict, target_name: str, skill_name: str, source_text: str, dest: Path):
+    """Write only explicitly configured target UI metadata."""
+    adapters = config.get("target_adapters", {}).get(target_name, {})
+    if adapters.get("openai_yaml"):
+        adapter = dest.parent / "agents" / "openai.yaml"
+        adapter.parent.mkdir(parents=True, exist_ok=True)
+        adapter.write_text(render_openai_yaml(skill_name, source_text))
+
+
 def read_stamp(text: str):
     m = re.search(r"synced-from: ([0-9a-f]+)", text)
     return m.group(1) if m else None
@@ -790,6 +813,7 @@ def cmd_sync_exact(args):
                     continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(canonical)
+                write_target_adapters(config, target_name, name, skill_file.read_text(), dest)
                 print(f"CREATED  {target_name}:{name} -> {version}")
                 synced += 1
                 continue
@@ -810,6 +834,7 @@ def cmd_sync_exact(args):
                 continue
 
             dest.write_text(canonical)
+            write_target_adapters(config, target_name, name, skill_file.read_text(), dest)
             mode = "reviewed" if not unchanged_from_base else "exact-base"
             print(f"SYNCED   {target_name}:{name} -> {version} ({mode})")
             synced += 1

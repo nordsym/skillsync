@@ -140,6 +140,9 @@ chmod +x skillsync.py
   "managed_roots": {
     "hermes": "~/.hermes/skills/nordsym"
   },
+  "target_adapters": {
+    "codex": { "openai_yaml": true }
+  },
   "webhook_url": null,
   "webhook_keychain": null
 }
@@ -154,6 +157,9 @@ chmod +x skillsync.py
 - `managed_roots`: optional per-runtime dedicated landing zones for governed
   Core. Use this when a runtime has self-evolved skills that must never be
   mistaken for or overwritten as a Core port.
+- `target_adapters`: optional native UI metadata. `openai_yaml` emits only
+  Codex's display name, short description, and explicit `$skill` prompt. It
+  never adds a tool, MCP, credential, identity, or policy grant.
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.
