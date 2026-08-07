@@ -185,6 +185,40 @@ class SyncExactTests(unittest.TestCase):
         finally:
             os.chdir(previous)
 
+    def test_prepare_discovery_preserves_local_body_without_claiming_parity(self):
+        port = self.target / "demo" / "SKILL.md"
+        port.write_text("# Local Demo\n\n## Purpose\n\nLocal learning.\n")
+        args = SimpleNamespace(skill="demo", target="test", reviewed=True)
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_prepare_discovery(args)
+        finally:
+            os.chdir(previous)
+        text = port.read_text()
+        fields, has_frontmatter = skillsync.parse_frontmatter(text)
+        self.assertTrue(has_frontmatter)
+        self.assertEqual(fields["name"], "demo")
+        self.assertNotIn("synced-from", text)
+        self.assertEqual(skillsync.normalized_skill_body(text), "# Local Demo\n\n## Purpose\n\nLocal learning.\n")
+
+    def test_prepare_discovery_requires_review_and_refuses_existing_frontmatter(self):
+        port = self.target / "demo" / "SKILL.md"
+        version = skillsync.source_version(self.source, self.skill)
+        port.write_text(skillsync.render_core_port("demo", self.skill.read_text(), version))
+        args = SimpleNamespace(skill="demo", target="test", reviewed=False)
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with self.assertRaisesRegex(SystemExit, "requires --reviewed"):
+                skillsync.cmd_prepare_discovery(args)
+            args.reviewed = True
+            with self.assertRaisesRegex(SystemExit, "already has frontmatter"):
+                skillsync.cmd_prepare_discovery(args)
+        finally:
+            os.chdir(previous)
+
 
 class PromotionAndSnapshotTests(unittest.TestCase):
     def setUp(self):

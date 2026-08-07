@@ -49,6 +49,8 @@ Usage:
   skillsync.py promote-candidate <target> <skill> [--output <path>]
                                                         # read-only local-skill promotion packet
   skillsync.py capability-snapshot [--output <path>]   # generated port-parity snapshot
+  skillsync.py prepare-discovery <skill> --target <target> --reviewed
+                                                        # add loader metadata without claiming Core parity
 """
 import argparse
 import difflib
@@ -254,6 +256,28 @@ def render_core_port(skill_name: str, source_text: str, version: str) -> str:
         "",
     ])
     return header + stamp_content(source_text, version)
+
+
+def render_discovery_port(skill_name: str, runtime_text: str) -> str:
+    """Add only standard loader metadata to an unformatted local adaptation.
+
+    This deliberately omits a `synced-from` marker. The port becomes natively
+    discoverable, but skillsync continues to report it as unreviewed until the
+    semantic local change is promoted, reconciled, or retired.
+    """
+    if not SKILL_NAME_RE.fullmatch(skill_name):
+        raise ValueError("Skill name must be a simple filename stem")
+    fields, has_frontmatter = parse_frontmatter(runtime_text)
+    if has_frontmatter:
+        raise ValueError("Port already has frontmatter; refuse to replace target-local metadata")
+    header = "\n".join([
+        "---",
+        f"name: {skill_name}",
+        f"description: {json.dumps(safe_description(runtime_text, skill_name), ensure_ascii=False)}",
+        "---",
+        "",
+    ])
+    return header + runtime_text.lstrip("\n")
 
 
 def read_stamp(text: str):
@@ -792,6 +816,26 @@ def cmd_sync_exact(args):
         sys.exit(1)
 
 
+def cmd_prepare_discovery(args):
+    """Safely make one reviewed local adaptation visible to native loaders."""
+    if not args.reviewed:
+        sys.exit("prepare-discovery requires --reviewed because it changes a runtime port")
+    config = load_config()
+    if args.target not in config["targets"]:
+        sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
+    if not SKILL_NAME_RE.fullmatch(args.skill):
+        sys.exit("Skill name must be a simple filename stem with no path separators")
+    dest = target_file(managed_target_dir(config, args.target), args.skill)
+    if not dest.exists():
+        sys.exit(f"No managed port for '{args.skill}' in target '{args.target}'")
+    try:
+        rendered = render_discovery_port(args.skill, dest.read_text())
+    except ValueError as exc:
+        sys.exit(str(exc))
+    dest.write_text(rendered)
+    print(f"PREPARED {args.target}:{args.skill} for native discovery (semantic parity remains unreviewed)")
+
+
 def cmd_check(args):
     config = load_config()
     source_dir = Path(config["source_dir"]).expanduser().resolve()
@@ -1131,6 +1175,12 @@ def main():
     p_sync.add_argument("--reviewed", action="store_true", help="allow overwrite of diverged or unstamped ports after propose-upstream review")
     p_sync.add_argument("--create-missing", action="store_true", help="create a missing managed Core port from reviewed canonical source")
 
+    p_prepare = sub.add_parser("prepare-discovery", help="add native loader metadata to one reviewed local adaptation without stamping parity")
+    p_prepare.add_argument("skill", help="managed skill name")
+    p_prepare.add_argument("--target", required=True, help="runtime target containing the adaptation")
+    p_prepare.add_argument("--reviewed", action="store_true", help="confirm the local adaptation was reviewed")
+    p_prepare.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
     p_check = sub.add_parser("check", help="report missing/stale ports")
     p_check.add_argument("skill", nargs="?", help="check only this skill")
     p_check.add_argument("--fail-on-drift", action="store_true", help="exit 1 if anything is out of sync")
@@ -1177,6 +1227,7 @@ def main():
         "init": cmd_init,
         "stamp": cmd_stamp,
         "sync-exact": cmd_sync_exact,
+        "prepare-discovery": cmd_prepare_discovery,
         "check": cmd_check,
         "registry": cmd_registry,
         "install-hook": cmd_install_hook,
