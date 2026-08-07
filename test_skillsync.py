@@ -138,6 +138,20 @@ class SyncExactTests(unittest.TestCase):
         self.assertIn("<!-- synced-from:", text)
         self.assertEqual(skillsync.normalized_skill_body(text), "# Demo\n\nVersion one.\n")
 
+    def test_configured_codex_adapter_is_minimal_and_source_derived(self):
+        (self.root / "skillsync.json").write_text(json.dumps({
+            "source_dir": str(self.source),
+            "targets": {"codex": str(self.target)},
+            "target_adapters": {"codex": {"openai_yaml": True}},
+        }))
+        self.run_sync()
+        adapter = self.target / "demo" / "agents" / "openai.yaml"
+        text = adapter.read_text()
+        self.assertIn('display_name: "Demo"', text)
+        self.assertIn('default_prompt: "Use $demo to apply this NordSym Core skill."', text)
+        self.assertNotIn("dependencies:", text)
+        self.assertNotIn("policy:", text)
+
     def test_missing_port_needs_explicit_creation_flag(self):
         (self.target / "demo" / "SKILL.md").unlink()
         args = type("Args", (), {"all": False, "skill": "demo", "reviewed": True, "create_missing": True})()
