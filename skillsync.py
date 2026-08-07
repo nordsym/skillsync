@@ -23,7 +23,10 @@ What it does mechanically:
   4. Optionally fire a webhook when real drift is found, and optionally
      install a git post-commit hook so drift is caught the moment the
      source changes, not on the next scheduled check.
-  5. Learn each target's frontmatter *shape* (not its prose) from the
+  5. Render exact Core ports with minimal portable `name` and `description`
+     frontmatter required by native skill loaders. The skill prose stays
+     canonical and is never generated or rewritten.
+  6. Learn each target's frontmatter *shape* (not its prose) from the
      skills already there, and scaffold a draft in that shape for a new
      port, pre-filled with the target's fixed fields and the source's raw
      content for a human/agent to actually adapt. Never auto-stamped, a
@@ -34,7 +37,7 @@ Zero dependencies beyond the Python 3.9+ standard library.
 Usage:
   skillsync.py init                                  # write skillsync.json in the current dir
   skillsync.py stamp [<skill>] [--all]                # mark port(s) as synced to the current source version
-  skillsync.py sync-exact [<skill>] [--all] [--reviewed]
+  skillsync.py sync-exact [<skill>] [--all] [--reviewed] [--create-missing]
                                                         # propagate canonical body with divergence guard
   skillsync.py check [<skill>] [--fail-on-drift] [--webhook]
   skillsync.py registry [--output <path>]             # emit a generated inventory of all target skills
@@ -43,6 +46,9 @@ Usage:
   skillsync.py scaffold <skill> <target> [--force]    # draft a new port in the learned shape, needs manual review
   skillsync.py propose-upstream <skill> --target <target> [--output <path>]
                                                         # read-only runtime-to-source proposal
+  skillsync.py promote-candidate <target> <skill> [--output <path>]
+                                                        # read-only local-skill promotion packet
+  skillsync.py capability-snapshot [--output <path>]   # generated port-parity snapshot
 """
 import argparse
 import difflib
@@ -56,9 +62,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
+SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+PROMOTION_RISK_PATTERNS = {
+    "credential-like reference": re.compile(r"(?i)\b(api[_-]?key|secret|token|password|private[_-]?key|keychain)\b"),
+    "client-bound reference": re.compile(r"(?i)(^|[ /])0?2\s*-\s*clients?([ /]|$)|\bclient[_ -]?(data|id|secret|token)\b"),
+    "external-action instruction": re.compile(r"(?i)\b(send|publish|deploy|invite|payment|outreach)\b"),
+}
 VENDOR_MARKERS = (
     "anthropics/skills",
     "trail of bits",
@@ -168,6 +180,16 @@ def find_skills(source_dir: Path):
     return sorted(p for p in source_dir.glob("*.md") if p.is_file())
 
 
+def managed_target_dir(config: dict, target_name: str) -> str:
+    """Return the explicit governed-Core landing zone for one runtime.
+
+    A runtime can keep locally evolved skills beside Core only when Core has
+    its own managed root. That prevents a name collision from being mistaken
+    for a managed port and overwritten by a synchronization operation.
+    """
+    return config.get("managed_roots", {}).get(target_name, config["targets"][target_name])
+
+
 def target_file(target_dir: str, skill_name: str) -> Path:
     """Find <skill_name>/SKILL.md under target_dir, at any depth.
 
@@ -182,6 +204,8 @@ def target_file(target_dir: str, skill_name: str) -> Path:
     found (the natural "this doesn't exist yet" default for stamp/check to
     report MISSING against).
     """
+    if not SKILL_NAME_RE.fullmatch(skill_name):
+        raise ValueError("Skill name must be a simple filename stem")
     base = Path(target_dir).expanduser()
     if not base.exists():
         return base / skill_name / "SKILL.md"
@@ -203,6 +227,33 @@ def target_file(target_dir: str, skill_name: str) -> Path:
 def stamp_content(text: str, version: str) -> str:
     marker = f"<!-- synced-from: {version} -->\n"
     return marker + strip_vault_wrappers(text)
+
+
+def safe_description(text: str, fallback_name: str) -> str:
+    """Extract one bounded parser-safe description from canonical prose."""
+    _title, description = parse_source_skill(text)
+    description = " ".join(description.split()).replace("\x00", "")
+    return (description or f"NordSym Core skill: {fallback_name}.")[:320]
+
+
+def render_core_port(skill_name: str, source_text: str, version: str) -> str:
+    """Render a portable exact Core port without inventing any prose.
+
+    Native loaders expect YAML at byte zero. Keep the source-version marker
+    immediately after the YAML document so loaders and skillsync both retain
+    their native parsing behavior. JSON strings are valid YAML scalars and
+    prevent source prose from injecting additional frontmatter fields.
+    """
+    if not SKILL_NAME_RE.fullmatch(skill_name):
+        raise ValueError("Skill name must be a simple filename stem")
+    header = "\n".join([
+        "---",
+        f"name: {skill_name}",
+        f"description: {json.dumps(safe_description(source_text, skill_name), ensure_ascii=False)}",
+        "---",
+        "",
+    ])
+    return header + stamp_content(source_text, version)
 
 
 def read_stamp(text: str):
@@ -249,14 +300,14 @@ def classify_upstream_proposal(source_body: str, runtime_body: str, base_body=No
 def cmd_propose_upstream(args):
     config = load_config()
     source_dir = Path(config["source_dir"]).expanduser().resolve()
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.skill):
+    if not SKILL_NAME_RE.fullmatch(args.skill):
         sys.exit("Skill name must be a simple filename stem with no path separators")
     source_file = source_dir / f"{args.skill}.md"
     if not source_file.exists():
         sys.exit(f"No canonical Core skill named '{args.skill}' in {source_dir}")
     if args.target not in config["targets"]:
         sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
-    runtime_file = target_file(config["targets"][args.target], args.skill)
+    runtime_file = target_file(managed_target_dir(config, args.target), args.skill)
     if not runtime_file.exists():
         sys.exit(f"No runtime port for '{args.skill}' in target '{args.target}'")
 
@@ -289,6 +340,7 @@ def cmd_propose_upstream(args):
             sys.exit("Refusing to write an upstream report through a symlink")
         resolved_output = output.resolve()
         protected_roots = [source_dir] + [Path(p).expanduser().resolve() for p in config["targets"].values()]
+        protected_roots += [Path(p).expanduser().resolve() for p in config.get("managed_roots", {}).values()]
         if resolved_output == source_file.resolve() or resolved_output == runtime_file.resolve():
             sys.exit("Refusing to overwrite canonical source or runtime port with a report")
         if any(root == resolved_output or root in resolved_output.parents for root in protected_roots):
@@ -301,6 +353,142 @@ def cmd_propose_upstream(args):
         print(f"Classification: {classification}")
     else:
         print(report, end="" if report.endswith("\n") else "\n")
+
+
+def runtime_candidate_files(config: dict, target_name: str, skill_name: str):
+    """Find non-managed runtime-local candidates with an exact skill stem."""
+    if target_name not in config["targets"]:
+        sys.exit(f"Unknown target '{target_name}'. Known: {', '.join(config['targets'])}")
+    if not SKILL_NAME_RE.fullmatch(skill_name):
+        sys.exit("Skill name must be a simple filename stem with no path separators")
+    runtime_root = Path(config["targets"][target_name]).expanduser()
+    managed_file = target_file(managed_target_dir(config, target_name), skill_name)
+    candidates = []
+    if runtime_root.exists():
+        for path in runtime_root.glob(f"**/{skill_name}/SKILL.md"):
+            if path.resolve() != managed_file.resolve() and ".archive" not in path.parts and "archive" not in path.parts:
+                candidates.append(path)
+    return sorted(candidates)
+
+
+def candidate_risk_flags(text: str) -> list:
+    return sorted(name for name, pattern in PROMOTION_RISK_PATTERNS.items() if pattern.search(text))
+
+
+def safe_report_output(path: Path, config: dict):
+    """Reject writes through links or into executable source/skill trees."""
+    if path.is_symlink():
+        sys.exit("Refusing to write a report through a symlink")
+    resolved = path.resolve()
+    protected = [Path(config["source_dir"]).expanduser().resolve()]
+    protected += [Path(p).expanduser().resolve() for p in config["targets"].values()]
+    protected += [Path(p).expanduser().resolve() for p in config.get("managed_roots", {}).values()]
+    if any(root == resolved or root in resolved.parents for root in protected):
+        sys.exit("Refusing to write a report inside a source or target skill tree")
+    if any(part == ".git" for part in resolved.parts):
+        sys.exit("Refusing to write a report inside .git")
+
+
+def cmd_promote_candidate(args):
+    """Produce a review-only packet for a runtime-local skill.
+
+    This never copies, enables, or promotes a skill. It gives the Core owner
+    enough provenance and risk signal to decide whether a local learning may
+    become an agent-agnostic governed capability.
+    """
+    config = load_config()
+    files = runtime_candidate_files(config, args.target, args.skill)
+    if not files:
+        sys.exit(f"No non-managed runtime-local skill named '{args.skill}' in target '{args.target}'")
+    if len(files) != 1:
+        listing = ", ".join(str(path) for path in files)
+        sys.exit(f"Ambiguous runtime-local skill '{args.skill}' in target '{args.target}': {listing}")
+    skill_file = files[0]
+    raw = skill_file.read_text(errors="ignore")
+    fields, has_frontmatter = parse_frontmatter(raw)
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    source_file = source_dir / f"{args.skill}.md"
+    report = {
+        "schema": "skillsync-promotion-candidate/v1",
+        "classification": "REVIEW_REQUIRED",
+        "candidate": {
+            "target": args.target,
+            "path": str(skill_file),
+            "sha256": hashlib.sha256(raw.encode()).hexdigest(),
+            "line_count": len(raw.splitlines()),
+            "frontmatter": {"present": has_frontmatter, "name": fields.get("name"), "description": fields.get("description")},
+            "risk_flags": candidate_risk_flags(raw),
+        },
+        "canonical_core": {
+            "exists": source_file.exists(),
+            "path": str(source_file),
+        },
+        "promotion_contract": [
+            "Review source and risk flags without copying secrets, client material, or execution authority.",
+            "Decide the smallest governed Core scope and target allowlist explicitly.",
+            "Add or revise canonical Core deliberately, then use sync-exact to create managed ports.",
+            "Native discovery and runtime authority remain separate acceptance gates.",
+        ],
+    }
+    rendered = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    if args.output:
+        output = Path(args.output).expanduser()
+        safe_report_output(output, config)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered)
+        print(f"Wrote {output}")
+    else:
+        print(rendered, end="")
+
+
+def cmd_capability_snapshot(args):
+    """Emit machine-readable Core port parity, never a claim of authority."""
+    config = load_config()
+    source_dir = Path(config["source_dir"]).expanduser().resolve()
+    skills = find_skills(source_dir)
+    snapshot = {
+        "schema": "skillsync-capability-snapshot/v1",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_dir": str(source_dir),
+        "semantics": {
+            "port_parity": "A current managed Core file exists and matches its canonical source version.",
+            "native_discovery": "not_observed",
+            "authority": "A visible skill grants no tools, identity, credential, client, or execution authority.",
+        },
+        "skills": [],
+    }
+    for skill_file in skills:
+        version = source_version(source_dir, skill_file)
+        ports = []
+        for target_name in config["targets"]:
+            path = target_file(managed_target_dir(config, target_name), skill_file.stem)
+            text = path.read_text(errors="ignore") if path.exists() else ""
+            stamp = read_stamp(text)
+            fields, has_frontmatter = parse_frontmatter(text)
+            ports.append({
+                "target": target_name,
+                "path": str(path),
+                "exists": path.exists(),
+                "source_version": stamp or None,
+                "parity": bool(stamp and versions_match(source_dir, stamp, version)),
+                "frontmatter": bool(has_frontmatter and fields.get("name") == skill_file.stem and fields.get("description")),
+                "native_discovery": "not_observed",
+            })
+        snapshot["skills"].append({
+            "name": skill_file.stem,
+            "source_version": version,
+            "source_sha256": hashlib.sha256(skill_file.read_bytes()).hexdigest(),
+            "ports": ports,
+        })
+    rendered = json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n"
+    if args.output:
+        output = Path(args.output).expanduser()
+        safe_report_output(output, config)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered)
+        print(f"Wrote {output}")
+    else:
+        print(rendered, end="")
 
 
 def has_symlink_component(path: Path, stop_at: Path) -> bool:
@@ -457,7 +645,7 @@ def cmd_scaffold(args):
 
     if args.target not in config["targets"]:
         sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
-    target_dir = config["targets"][args.target]
+    target_dir = managed_target_dir(config, args.target)
 
     fmt = config.get("formats", {}).get(args.target)
     if fmt is None:
@@ -534,7 +722,7 @@ def cmd_stamp(args):
         name = skill_file.stem
         version = source_version(source_dir, skill_file)
         for target_name, target_dir in config["targets"].items():
-            dest = target_file(target_dir, name)
+            dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
                 print(f"MISSING  {target_name}:{name} (not stamped, port does not exist)")
                 continue
@@ -551,6 +739,8 @@ def cmd_sync_exact(args):
     propose-upstream has been inspected.
     """
     config = load_config()
+    if getattr(args, "create_missing", False) and not args.reviewed:
+        sys.exit("--create-missing requires --reviewed because it installs a new managed Core port")
     source_dir = Path(config["source_dir"]).expanduser().resolve()
     skills = find_skills(source_dir)
     if not args.all:
@@ -563,12 +753,18 @@ def cmd_sync_exact(args):
     for skill_file in skills:
         name = skill_file.stem
         version = source_version(source_dir, skill_file)
-        canonical = stamp_content(skill_file.read_text(), version)
+        canonical = render_core_port(name, skill_file.read_text(), version)
         for target_name, target_dir in config["targets"].items():
-            dest = target_file(target_dir, name)
+            dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
-                print(f"MISSING  {target_name}:{name}")
-                refused += 1
+                if not getattr(args, "create_missing", False):
+                    print(f"MISSING  {target_name}:{name}")
+                    refused += 1
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(canonical)
+                print(f"CREATED  {target_name}:{name} -> {version}")
+                synced += 1
                 continue
 
             runtime_text = dest.read_text()
@@ -615,7 +811,7 @@ def cmd_check(args):
         name = skill_file.stem
         current = source_version(source_dir, skill_file)
         for target_name, target_dir in config["targets"].items():
-            dest = target_file(target_dir, name)
+            dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
                 print(f"MISSING  {target_name}:{name}")
                 missing_list.append(f"{target_name}:{name}")
@@ -675,7 +871,7 @@ def cmd_registry(args):
             runtime_counts[target_name] = runtime_counts.get(target_name, 0) + 1
             continue
 
-        core_targets = {name: target_file(target_raw, name) for name in core_names}
+        core_targets = {name: target_file(managed_target_dir(config, target_name), name) for name in core_names}
         seen_core_names = {}
 
         for skill_file in sorted(target_dir.glob("**/SKILL.md")):
@@ -933,6 +1129,7 @@ def main():
     p_sync.add_argument("skill", nargs="?", help="skill name (omit with --all)")
     p_sync.add_argument("--all", action="store_true", help="sync every skill")
     p_sync.add_argument("--reviewed", action="store_true", help="allow overwrite of diverged or unstamped ports after propose-upstream review")
+    p_sync.add_argument("--create-missing", action="store_true", help="create a missing managed Core port from reviewed canonical source")
 
     p_check = sub.add_parser("check", help="report missing/stale ports")
     p_check.add_argument("skill", nargs="?", help="check only this skill")
@@ -960,6 +1157,16 @@ def main():
     p_upstream.add_argument("--output", help="write the proposal report to a local file")
     p_upstream.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
 
+    p_candidate = sub.add_parser("promote-candidate", help="emit a review-only packet for one runtime-local skill")
+    p_candidate.add_argument("target", help="runtime target containing the local skill")
+    p_candidate.add_argument("skill", help="runtime-local skill name")
+    p_candidate.add_argument("--output", help="write the candidate packet outside source/target roots")
+    p_candidate.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
+    p_snapshot = sub.add_parser("capability-snapshot", help="emit managed Core parity without claiming native discovery")
+    p_snapshot.add_argument("--output", help="write JSON outside source/target roots")
+    p_snapshot.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
     args = parser.parse_args()
 
     global CONFIG_FILE
@@ -976,6 +1183,8 @@ def main():
         "learn-format": cmd_learn_format,
         "scaffold": cmd_scaffold,
         "propose-upstream": cmd_propose_upstream,
+        "promote-candidate": cmd_promote_candidate,
+        "capability-snapshot": cmd_capability_snapshot,
     }[args.command](args)
 
 

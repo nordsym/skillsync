@@ -96,7 +96,7 @@ class SyncExactTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "source update"], cwd=self.root, check=True)
 
     def run_sync(self, reviewed=False):
-        args = type("Args", (), {"all": False, "skill": "demo", "reviewed": reviewed})()
+        args = type("Args", (), {"all": False, "skill": "demo", "reviewed": reviewed, "create_missing": False})()
         previous = Path.cwd()
         try:
             os.chdir(self.root)
@@ -127,10 +127,123 @@ class SyncExactTests(unittest.TestCase):
         self.assertNotIn("Runtime learning", port.read_text())
         self.assertEqual(skillsync.normalized_skill_body(port.read_text()), "# Demo\n\nVersion two.\n")
 
+    def test_exact_port_starts_with_loader_frontmatter(self):
+        self.run_sync()
+        port = self.target / "demo" / "SKILL.md"
+        text = port.read_text()
+        fields, has_frontmatter = skillsync.parse_frontmatter(text)
+        self.assertTrue(has_frontmatter)
+        self.assertEqual(fields["name"], "demo")
+        self.assertTrue(fields["description"])
+        self.assertIn("<!-- synced-from:", text)
+        self.assertEqual(skillsync.normalized_skill_body(text), "# Demo\n\nVersion one.\n")
+
+    def test_missing_port_needs_explicit_creation_flag(self):
+        (self.target / "demo" / "SKILL.md").unlink()
+        args = type("Args", (), {"all": False, "skill": "demo", "reviewed": True, "create_missing": True})()
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_sync_exact(args)
+        finally:
+            os.chdir(previous)
+        created = self.target / "demo" / "SKILL.md"
+        self.assertTrue(created.exists())
+        self.assertEqual(skillsync.parse_frontmatter(created.read_text())[0]["name"], "demo")
+
+    def test_managed_root_prevents_local_name_collision_from_being_overwritten(self):
+        managed = self.target / "nordsym"
+        local = self.target / "outbound" / "demo" / "SKILL.md"
+        local.parent.mkdir(parents=True)
+        local.write_text("# Local learning\n")
+        (self.target / "demo" / "SKILL.md").unlink()
+        (self.root / "skillsync.json").write_text(json.dumps({
+            "source_dir": str(self.source),
+            "targets": {"test": str(self.target)},
+            "managed_roots": {"test": str(managed)},
+        }))
+        args = type("Args", (), {"all": False, "skill": "demo", "reviewed": True, "create_missing": True})()
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_sync_exact(args)
+        finally:
+            os.chdir(previous)
+        self.assertEqual(local.read_text(), "# Local learning\n")
+        self.assertTrue((managed / "demo" / "SKILL.md").exists())
+
+    def test_create_missing_requires_reviewed_flag(self):
+        (self.target / "demo" / "SKILL.md").unlink()
+        args = type("Args", (), {"all": False, "skill": "demo", "reviewed": False, "create_missing": True})()
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with self.assertRaisesRegex(SystemExit, "requires --reviewed"):
+                skillsync.cmd_sync_exact(args)
+        finally:
+            os.chdir(previous)
+
+
+class PromotionAndSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.source = self.root / "source"
+        self.target = self.root / "target"
+        self.source.mkdir()
+        self.target.mkdir()
+        (self.source / "demo.md").write_text("# Demo\n\n## Purpose\n\nPortable capability.\n")
+        (self.target / "local-demo").mkdir()
+        (self.target / "local-demo" / "SKILL.md").write_text("---\nname: local-demo\ndescription: local\n---\n# Local\n")
+        (self.root / "skillsync.json").write_text(json.dumps({
+            "source_dir": str(self.source),
+            "targets": {"hermes": str(self.target)},
+            "managed_roots": {"hermes": str(self.target / "nordsym")},
+        }))
+        self.old_config = skillsync.CONFIG_FILE
+        skillsync.CONFIG_FILE = "skillsync.json"
+
+    def tearDown(self):
+        skillsync.CONFIG_FILE = self.old_config
+        self.tmp.cleanup()
+
+    def test_candidate_packet_is_review_only_and_risk_flagged(self):
+        candidate = self.target / "local-demo" / "SKILL.md"
+        candidate.write_text(candidate.read_text() + "Use Keychain token only after review.\n")
+        args = SimpleNamespace(target="hermes", skill="local-demo", output=str(self.root / "packet.json"))
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_promote_candidate(args)
+        finally:
+            os.chdir(previous)
+        packet = json.loads((self.root / "packet.json").read_text())
+        self.assertEqual(packet["classification"], "REVIEW_REQUIRED")
+        self.assertIn("credential-like reference", packet["candidate"]["risk_flags"])
+        self.assertFalse(packet["canonical_core"]["exists"])
+        self.assertIn("promotion_contract", packet)
+
+    def test_capability_snapshot_does_not_claim_native_discovery(self):
+        args = SimpleNamespace(output=str(self.root / "snapshot.json"))
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_capability_snapshot(args)
+        finally:
+            os.chdir(previous)
+        snapshot = json.loads((self.root / "snapshot.json").read_text())
+        self.assertEqual(snapshot["schema"], "skillsync-capability-snapshot/v1")
+        self.assertEqual(snapshot["semantics"]["native_discovery"], "not_observed")
+        self.assertEqual(snapshot["skills"][0]["ports"][0]["native_discovery"], "not_observed")
+
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.3.1")
+        self.assertEqual(skillsync.__version__, "0.4.0")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
