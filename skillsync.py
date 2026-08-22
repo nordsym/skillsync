@@ -53,6 +53,9 @@ Usage:
                                                         # read-only local-skill promotion packet
   skillsync.py capability-snapshot [--output <path>]   # generated port-parity snapshot
   skillsync.py catalog-audit <profile> [--strict]      # model-visible catalog budget check
+  skillsync.py catalog-search <profile> <query>        # find one skill outside startup context
+  skillsync.py catalog-read <profile> <skill>          # load one exact catalog skill on demand
+  skillsync.py install-catalog-router <target> --profile <profile> --reviewed
   skillsync.py compact-descriptions <target> --reviewed # compact discovery metadata only
   skillsync.py prepare-discovery <skill> --target <target> --reviewed
                                                         # add loader metadata without claiming Core parity
@@ -63,6 +66,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -70,12 +74,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 DEFAULT_DISCOVERY_DESCRIPTION_MAX_CHARS = 160
 DEFAULT_CATALOG_ENTRY_OVERHEAD_TOKENS = 8
+DEFAULT_CATALOG_READ_MAX_CHARS = 16000
 PROMOTION_RISK_PATTERNS = {
     "credential-like reference": re.compile(r"(?i)\b(api[_-]?key|secret|token|password|private[_-]?key|keychain)\b"),
     "client-bound reference": re.compile(r"(?i)(^|[ /])0?2\s*-\s*clients?([ /]|$)|\bclient[_ -]?(data|id|secret|token)\b"),
@@ -682,7 +687,7 @@ def catalog_profile(config: dict, profile_name: str) -> dict:
 CODEX_PLUGIN_SECTION_RE = re.compile(r'^\[plugins\."([^"\n]+)"\]\s*$')
 
 
-def enabled_codex_plugin_ids(config_path: Path):
+def enabled_codex_plugin_ids(config_path: Path, include_disabled=False):
     """Read the small TOML subset needed for Codex plugin enablement.
 
     Skillsync remains Python 3.9 compatible, so it cannot depend on
@@ -690,22 +695,24 @@ def enabled_codex_plugin_ids(config_path: Path):
     intentionally parsed narrowly rather than claiming general TOML support.
     """
     current = None
+    plugins = []
     enabled = []
     for line in config_path.read_text(errors="ignore").splitlines():
         stripped = line.strip()
         match = CODEX_PLUGIN_SECTION_RE.match(stripped)
         if match:
             current = match.group(1)
+            plugins.append(current)
             continue
         if stripped.startswith("["):
             current = None
             continue
         if current and re.match(r"^enabled\s*=\s*true\s*(?:#.*)?$", stripped, re.IGNORECASE):
             enabled.append(current)
-    return enabled
+    return plugins if include_disabled else enabled
 
 
-def codex_plugin_roots(config_path: Path, cache_dir=None):
+def codex_plugin_roots(config_path: Path, cache_dir=None, include_disabled=False):
     """Resolve enabled Codex plugin skill roots from the local cache.
 
     A plugin may supply tools without a skill folder. That is not an audit
@@ -715,7 +722,7 @@ def codex_plugin_roots(config_path: Path, cache_dir=None):
     """
     cache = Path(cache_dir).expanduser() if cache_dir else config_path.parent / "plugins" / "cache"
     roots = []
-    for plugin_id in enabled_codex_plugin_ids(config_path):
+    for plugin_id in enabled_codex_plugin_ids(config_path, include_disabled):
         if "@" not in plugin_id:
             continue
         name, provider = plugin_id.rsplit("@", 1)
@@ -729,6 +736,15 @@ def codex_plugin_roots(config_path: Path, cache_dir=None):
             if skill_dir.is_dir():
                 roots.append({"root": f"plugin:{plugin_id}", "path": skill_dir.resolve()})
     return roots
+
+
+def cached_plugin_roots(cache_dir: Path):
+    """Return every installed plugin skill root for an on-demand library."""
+    return [
+        {"root": f"plugin-cache:{skill_dir.relative_to(cache_dir)}", "path": skill_dir.resolve()}
+        for skill_dir in sorted(cache_dir.glob("*/*/*/skills"))
+        if skill_dir.is_dir()
+    ]
 
 
 def catalog_roots(config: dict, profile_name: str):
@@ -748,7 +764,16 @@ def catalog_roots(config: dict, profile_name: str):
             if not config_path.is_file():
                 roots.append({"root": f"codex-config:{config_path}", "path": config_path})
                 continue
-            roots.extend(codex_plugin_roots(config_path, raw.get("cache_dir")))
+            roots.extend(codex_plugin_roots(
+                config_path, raw.get("cache_dir"), raw.get("include_disabled", False)
+            ))
+            continue
+        elif isinstance(raw, dict) and isinstance(raw.get("plugin_cache"), str):
+            cache_dir = Path(raw["plugin_cache"]).expanduser().resolve()
+            if not cache_dir.is_dir():
+                roots.append({"root": f"plugin-cache:{cache_dir}", "path": cache_dir})
+                continue
+            roots.extend(cached_plugin_roots(cache_dir))
             continue
         elif isinstance(raw, dict) and isinstance(raw.get("path"), str):
             label = raw.get("name") or raw["path"]
@@ -756,7 +781,7 @@ def catalog_roots(config: dict, profile_name: str):
         else:
             raise ValueError(
                 f"Catalog profile '{profile_name}' has an invalid root. "
-                "Use a target name, a path, {name, path}, or {codex_config}."
+                "Use a target name, a path, {name, path}, {codex_config}, or {plugin_cache}."
             )
         roots.append({"root": str(label), "path": Path(path).expanduser().resolve()})
     return roots
@@ -977,6 +1002,160 @@ def cmd_catalog_audit(args):
         sys.exit(1)
 
 
+def catalog_search(config: dict, profile_name: str, query: str, limit: int = 8):
+    """Find skills in the full library without injecting that library at startup."""
+    terms = [term for term in re.findall(r"[a-z0-9][a-z0-9_-]*", query.lower()) if len(term) > 1]
+    if not terms:
+        raise ValueError("Search query needs at least one word or identifier")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    results = []
+    by_name = {}
+    root_priority = {"codex": 0, "agents": 1, "claude": 2, "grok": 3, "openclaw": 4, "hermes": 5}
+    for entry in catalog_audit(config, profile_name)["entries"]:
+        raw = Path(entry["path"]).read_text(errors="ignore")
+        fields, _has_frontmatter = parse_frontmatter(raw)
+        haystacks = (entry["name"].lower(), fields.get("description", "").lower(), entry["relative_path"].lower())
+        score = 0
+        for term in terms:
+            if term in haystacks[0]:
+                score += 12
+            if term in haystacks[1]:
+                score += 4
+            if term in haystacks[2]:
+                score += 1
+        if score:
+            result = {
+                "name": entry["name"],
+                "path": entry["path"],
+                "root": entry["root"],
+                "description": compact_discovery_description(fields.get("description", ""), 240),
+                "score": score,
+                "relative_depth": len(Path(entry["relative_path"]).parts),
+            }
+            by_name.setdefault(entry["name"], []).append(result)
+    for matches in by_name.values():
+        matches.sort(key=lambda item: (-item["score"], root_priority.get(item["root"], 99), item["relative_depth"], item["path"]))
+        primary = matches[0]
+        primary["alternatives"] = [item["path"] for item in matches[1:]]
+        primary.pop("relative_depth")
+        results.append(primary)
+    return sorted(results, key=lambda item: (-item["score"], item["name"], item["path"]))[:limit]
+
+
+def catalog_read(config: dict, profile_name: str, skill_name: str, path=None, max_chars=DEFAULT_CATALOG_READ_MAX_CHARS):
+    """Read one audited library skill. Never accept an arbitrary filesystem path."""
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1:
+        raise ValueError("max_chars must be a positive integer")
+    if max_chars > DEFAULT_CATALOG_READ_MAX_CHARS:
+        raise ValueError(
+            f"max_chars cannot exceed the hard {DEFAULT_CATALOG_READ_MAX_CHARS}-character catalog-read ceiling. "
+            "Read a narrower source instead of expanding the conversation payload."
+        )
+    matches = [entry for entry in catalog_audit(config, profile_name)["entries"] if entry["name"] == skill_name]
+    if path is not None:
+        matches = [entry for entry in matches if entry["path"] == str(Path(path).expanduser().resolve())]
+    if not matches:
+        raise ValueError(f"No catalog skill named '{skill_name}' in profile '{profile_name}'")
+    if len(matches) > 1:
+        candidates = ", ".join(entry["path"] for entry in matches)
+        raise ValueError(f"Catalog skill '{skill_name}' is ambiguous. Choose --path: {candidates}")
+    entry = matches[0]
+    content = Path(entry["path"]).read_text(errors="ignore")
+    if len(content) > max_chars:
+        raise ValueError(
+            f"Catalog skill '{skill_name}' is {len(content)} characters, above the {max_chars}-character read limit. "
+            "Read a narrower source instead of expanding the conversation payload."
+        )
+    return {
+        "schema": "skillsync-catalog-skill/v1",
+        "profile": profile_name,
+        "name": entry["name"],
+        "path": entry["path"],
+        "content": content,
+        "content_chars": len(content),
+    }
+
+
+def cmd_catalog_search(args):
+    config = load_config()
+    try:
+        results = catalog_search(config, args.profile, " ".join(args.query), args.limit)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if args.json:
+        print(json.dumps({"schema": "skillsync-catalog-search/v1", "profile": args.profile, "results": results}, indent=2, ensure_ascii=False))
+        return
+    if not results:
+        print("No matching catalog skills.")
+        return
+    for result in results:
+        print(f"{result['name']}\t{result['description']}\t{result['path']}")
+
+
+def cmd_catalog_read(args):
+    config = load_config()
+    try:
+        result = catalog_read(config, args.profile, args.skill, args.path, args.max_chars)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(result["content"], end="" if result["content"].endswith("\n") else "\n")
+
+
+def render_catalog_router(profile_name: str, command: str, config_path: Path) -> str:
+    """Render a tiny native skill that routes into the library on demand."""
+    config_arg = shlex.quote(str(config_path))
+    return "\n".join([
+        "---",
+        "name: skillsync-catalog-router",
+        'description: "Find and load one relevant skill from the full catalog without exposing every skill at startup."',
+        "---",
+        "# SkillSync Catalog Router",
+        "",
+        "Use this when the task needs a specialised capability that is not already active.",
+        "",
+        "1. Search the full library:",
+        "```bash",
+        f"{command} catalog-search {shlex.quote(profile_name)} \"<task terms>\" --json --config {config_arg}",
+        "```",
+        "2. Pick one result. Read exactly that audited path:",
+        "```bash",
+        f"{command} catalog-read {shlex.quote(profile_name)} <skill-name> --path \"<result path>\" --config {config_arg}",
+        "```",
+        "3. A hard 16,000-character ceiling applies to every read. Read a narrower source when a skill exceeds it.",
+        "4. Apply the loaded instructions. Do not load unrelated skills pre-emptively.",
+        "5. A loaded skill does not enable a disabled plugin or grant its tools. Use an already available CLI or MCP path, or request plugin activation and a fresh session when the skill requires it.",
+        "",
+        "The full library remains available. Only the selected instruction enters this conversation.",
+        "",
+    ])
+
+
+def cmd_install_catalog_router(args):
+    if not args.reviewed:
+        sys.exit("install-catalog-router requires --reviewed because it creates a model-visible router skill")
+    config = load_config()
+    targets = {**config.get("targets", {}), **config.get("catalog_router_targets", {})}
+    if args.target not in targets:
+        sys.exit(f"Unknown router target '{args.target}'. Known: {', '.join(targets)}")
+    try:
+        catalog_profile(config, args.profile)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    target = Path(targets[args.target]).expanduser()
+    destination = target / "skillsync-catalog-router" / "SKILL.md"
+    if destination.exists() and not args.force:
+        sys.exit(f"{destination} already exists. Use --force only after reviewing the current router.")
+    config_path = (Path.cwd() / CONFIG_FILE).resolve()
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(render_catalog_router(args.profile, command, config_path))
+    print(f"INSTALLED catalog router at {destination}")
+
+
 def learn_format(target_dir: str) -> dict:
     """Infer a target's frontmatter shape from the skills already ported
     there: does it use frontmatter at all, which fields recur, and what
@@ -1139,7 +1318,17 @@ def cmd_init(args):
                     "entry_overhead_tokens": 8,
                     "budget_tokens": 3500,
                     "fail_on_duplicates": True,
-                }
+                },
+                # This is a library profile, not a startup admission profile.
+                # Add installed plugin caches explicitly when the host keeps
+                # them outside these native roots.
+                "full-library": {
+                    "roots": ["claude", "codex", "agents"],
+                    "max_description_chars": 160,
+                    "entry_overhead_tokens": 8,
+                    "fail_on_duplicates": False,
+                    "fail_on_metadata": False,
+                },
             },
             "webhook_url": None,
         }
@@ -1680,6 +1869,28 @@ def main():
     p_catalog.add_argument("--strict", action="store_true", help="exit 1 for any configured catalog-policy violation")
     p_catalog.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
 
+    p_catalog_search = sub.add_parser("catalog-search", help="search a full skill library without adding it to startup context")
+    p_catalog_search.add_argument("profile", help="catalog_profiles entry to search")
+    p_catalog_search.add_argument("query", nargs="+", help="task terms or capability to find")
+    p_catalog_search.add_argument("--limit", type=int, default=8, help="maximum results (default: 8)")
+    p_catalog_search.add_argument("--json", action="store_true", help="emit machine-readable results")
+    p_catalog_search.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
+    p_catalog_read = sub.add_parser("catalog-read", help="read one audited skill from a full library")
+    p_catalog_read.add_argument("profile", help="catalog_profiles entry to read from")
+    p_catalog_read.add_argument("skill", help="exact declared skill name")
+    p_catalog_read.add_argument("--path", help="required when the declared skill name is ambiguous")
+    p_catalog_read.add_argument("--max-chars", type=int, default=DEFAULT_CATALOG_READ_MAX_CHARS, help="maximum instruction payload to emit, 1-16000 (default: 16000)")
+    p_catalog_read.add_argument("--json", action="store_true", help="emit machine-readable skill content")
+    p_catalog_read.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
+    p_router = sub.add_parser("install-catalog-router", help="install one small native router skill for an on-demand catalog")
+    p_router.add_argument("target", help="runtime target where the router should be discoverable")
+    p_router.add_argument("--profile", required=True, help="catalog profile the router searches")
+    p_router.add_argument("--reviewed", action="store_true", help="confirm this target should expose the router")
+    p_router.add_argument("--force", action="store_true", help="replace an existing reviewed router")
+    p_router.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
     sub.add_parser("install-hook", help="install a git post-commit hook in the source repo")
 
     p_learn = sub.add_parser("learn-format", help="infer a target's frontmatter shape from its existing skills")
@@ -1722,6 +1933,9 @@ def main():
         "check": cmd_check,
         "registry": cmd_registry,
         "catalog-audit": cmd_catalog_audit,
+        "catalog-search": cmd_catalog_search,
+        "catalog-read": cmd_catalog_read,
+        "install-catalog-router": cmd_install_catalog_router,
         "install-hook": cmd_install_hook,
         "learn-format": cmd_learn_format,
         "scaffold": cmd_scaffold,

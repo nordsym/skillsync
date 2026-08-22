@@ -360,7 +360,7 @@ class PromotionAndSnapshotTests(unittest.TestCase):
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.5.0")
+        self.assertEqual(skillsync.__version__, "0.6.0")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
@@ -496,6 +496,77 @@ class CatalogAuditTests(unittest.TestCase):
         profile = self.config(roots=[{"codex_config": str(lexical_config)}])
         report = skillsync.catalog_audit(profile, "general")
         self.assertEqual([entry["name"] for entry in report["entries"]], ["real"])
+
+    def test_catalog_search_ranks_name_then_description_and_catalog_read_is_exact(self):
+        self.write_skill("web", "web-deploy", "Deploy a website safely.")
+        self.write_skill("notes", "meeting-notes", "Turn a meeting into an action plan.")
+        profile = self.config()
+        found = skillsync.catalog_search(profile, "general", "deploy website", 5)
+        self.assertEqual(found[0]["name"], "web-deploy")
+        content = skillsync.catalog_read(profile, "general", "web-deploy")
+        self.assertIn("Deploy a website safely.", content["content"])
+
+    def test_catalog_search_collapses_mirrored_names_and_keeps_alternative_paths(self):
+        codex = self.root / "codex"
+        agents = self.root / "agents"
+        for root, text in ((codex, "codex copy"), (agents, "agents copy")):
+            skill = root / "shared" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                f"---\nname: shared-skill\ndescription: {json.dumps(text)}\n---\n# Shared\n"
+            )
+        profile = self.config(roots=[
+            {"name": "agents", "path": str(agents)},
+            {"name": "codex", "path": str(codex)},
+        ])
+        results = skillsync.catalog_search(profile, "general", "shared", 5)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["root"], "codex")
+        self.assertEqual(results[0]["alternatives"], [str((agents / "shared" / "SKILL.md").resolve())])
+
+    def test_catalog_read_refuses_ambiguous_name_without_an_exact_path(self):
+        self.write_skill("one/duplicate", "duplicate", "first")
+        self.write_skill("two/duplicate", "duplicate", "second")
+        profile = self.config()
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            skillsync.catalog_read(profile, "general", "duplicate")
+
+    def test_catalog_read_enforces_a_bounded_instruction_payload(self):
+        self.write_skill("large", "large", "large skill")
+        skill = self.catalog / "large" / "SKILL.md"
+        skill.write_text(skill.read_text() + "x" * 300)
+        profile = self.config()
+        with self.assertRaisesRegex(ValueError, "read limit"):
+            skillsync.catalog_read(profile, "general", "large", max_chars=100)
+        with self.assertRaisesRegex(ValueError, "hard 16000-character"):
+            skillsync.catalog_read(profile, "general", "large", max_chars=16001)
+
+    def test_install_catalog_router_writes_one_small_model_visible_skill(self):
+        router_root = self.root / "router-target"
+        config = self.config()
+        config["catalog_router_targets"] = {"desktop": str(router_root)}
+        (self.root / "skillsync.json").write_text(json.dumps(config))
+        args = SimpleNamespace(target="desktop", profile="general", reviewed=True, force=False)
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_install_catalog_router(args)
+        finally:
+            os.chdir(previous)
+        router = router_root / "skillsync-catalog-router" / "SKILL.md"
+        self.assertTrue(router.exists())
+        self.assertIn("catalog-search general", router.read_text())
+        self.assertIn("catalog-read general", router.read_text())
+
+    def test_catalog_library_can_search_all_cached_plugins_without_enabling_them(self):
+        cache = self.root / "plugin-cache"
+        skill = cache / "provider" / "disabled-plugin" / "1" / "skills" / "specialist" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: specialist\ndescription: Handle specialised work.\n---\n# Specialist\n")
+        profile = self.config(roots=[{"plugin_cache": str(cache)}])
+        results = skillsync.catalog_search(profile, "general", "specialised", 5)
+        self.assertEqual(results[0]["name"], "specialist")
 
 
 class WebhookCredentialTests(unittest.TestCase):

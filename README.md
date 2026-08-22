@@ -102,6 +102,15 @@ chmod +x skillsync.py
 # checks the configured model-visible `general` profile and exits 1 on a
 # configured catalog-budget or metadata violation
 
+./skillsync.py catalog-search full-library "deploy a Vercel site" --json
+# finds a relevant skill in the complete library without adding the entire
+# library to the model-visible startup list
+
+./skillsync.py catalog-read full-library vercel-deploy --path /absolute/path/to/SKILL.md
+# reads one audited skill after search selected it. An ambiguous name requires
+# its exact returned path. It emits at most 16,000 instruction characters by
+# hard ceiling, so one oversized skill cannot recreate the startup-context failure.
+
 ./skillsync.py compact-descriptions codex --reviewed
 # shortens only native discovery descriptions in one reviewed target. It never
 # changes the instruction body below the frontmatter.
@@ -164,6 +173,9 @@ chmod +x skillsync.py
       "fail_on_duplicates": true
     }
   },
+  "catalog_router_targets": {
+    "desktop": "~/.codex/skills"
+  },
   "webhook_url": null,
   "webhook_keychain": null
 }
@@ -184,7 +196,9 @@ chmod +x skillsync.py
 - `catalog_profiles`: explicit model-exposure contracts. `roots` can name an
   existing target, a filesystem path, `{ "name": "...", "path": "..." }`,
   or `{ "codex_config": "~/.codex/config.toml" }` to resolve only the
-  currently enabled Codex plugin skill roots from its local cache.
+  currently enabled Codex plugin skill roots from its local cache. Use
+  `{ "plugin_cache": "~/.codex/plugins/cache" }` for a full on-demand
+  library, including specialist plugins that are not active at startup.
   The audit recursively measures every `SKILL.md` in those roots because that
   is what native loaders normally see. It never silently deduplicates a
   catalog for the estimate. Keep the general profile small and use specialist
@@ -196,6 +210,9 @@ chmod +x skillsync.py
   plugin roots whose upstream descriptions you cannot yet change. The audit
   still reports that drift, but `--strict` will focus on actual admission
   limits and duplicate-name policy.
+- `catalog_router_targets`: optional native skill roots that receive the
+  tiny on-demand router without becoming a synchronized Core target. Use this
+  for a host-specific shell such as a desktop app.
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.
@@ -274,6 +291,18 @@ past its own safe budget. Keep a small general profile always available and
 load specialist packs intentionally. Do not place a vendor package or another
 runtime's embedded `.claude` or `.codex` tree below a recursively discovered
 root unless that duplication is deliberate and budgeted.
+
+You do not need to choose between a complete library and a usable startup
+context. Install one router into the native skill root:
+
+```bash
+./skillsync.py install-catalog-router desktop --profile full-library --reviewed
+```
+
+The router searches the full catalog, reads one exact audited `SKILL.md`, and
+keeps every unrelated skill outside the current conversation. It does not
+enable a disabled plugin or grant its tools. A skill can therefore remain
+available as guidance while plugin activation stays an explicit host decision.
 
 When a local target already has sound instruction bodies but bloated or missing
 discovery descriptions, normalize that metadata separately:
