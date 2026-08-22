@@ -741,10 +741,10 @@ def catalog_roots(config: dict, profile_name: str):
         elif isinstance(raw, str):
             label, path = raw, raw
         elif isinstance(raw, dict) and isinstance(raw.get("codex_config"), str):
-            # Keep the configured lexical parent. Buzz uses a config symlink
-            # whose sibling plugin cache is intentionally different from the
-            # target of that symlink.
-            config_path = Path(raw["codex_config"]).expanduser()
+            # Follow the actual configuration file. A desktop host may expose
+            # a convenience symlink, but its live plugin registry belongs to
+            # the config target unless the profile explicitly sets cache_dir.
+            config_path = Path(raw["codex_config"]).expanduser().resolve()
             if not config_path.is_file():
                 roots.append({"root": f"codex-config:{config_path}", "path": config_path})
                 continue

@@ -479,6 +479,24 @@ class CatalogAuditTests(unittest.TestCase):
         self.assertEqual([entry["name"] for entry in report["entries"]], ["alpha", "remote"])
         self.assertEqual(report["roots"][0]["root"], "plugin:alpha@provider")
 
+    def test_catalog_audit_follows_a_symlinked_codex_config_to_its_live_cache(self):
+        real_home = self.root / "real-codex"
+        real_config = real_home / "config.toml"
+        real_config.parent.mkdir(parents=True)
+        real_config.write_text('[plugins."alpha@provider"]\nenabled = true\n')
+        lexical_config = self.root / "buzz" / "config.toml"
+        lexical_config.parent.mkdir(parents=True)
+        lexical_config.symlink_to(real_config)
+        real_skill = real_home / "plugins" / "cache" / "provider" / "alpha" / "1" / "skills" / "real" / "SKILL.md"
+        stale_skill = lexical_config.parent / "plugins" / "cache" / "provider" / "alpha" / "1" / "skills" / "stale" / "SKILL.md"
+        real_skill.parent.mkdir(parents=True)
+        stale_skill.parent.mkdir(parents=True)
+        real_skill.write_text("---\nname: real\ndescription: live\n---\n# Real\n")
+        stale_skill.write_text("---\nname: stale\ndescription: stale\n---\n# Stale\n")
+        profile = self.config(roots=[{"codex_config": str(lexical_config)}])
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertEqual([entry["name"] for entry in report["entries"]], ["real"])
+
 
 class WebhookCredentialTests(unittest.TestCase):
     def test_resolves_keychain_secret_only_in_memory(self):
