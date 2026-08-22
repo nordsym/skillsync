@@ -39,6 +39,9 @@ does mechanically:
    learned something worth reviewing for canonical source. It normalizes
    wrappers, shows a unified diff, detects two-sided conflicts when a stamped
    git base is available, and never writes to the source or runtime port.
+9. Audits the exact skill roots a model can see before the host trims the
+   catalog. It reports duplicate names, long descriptions, missing metadata,
+   entry count, and a deliberately conservative rendered-list token estimate.
 
 ## Why this doesn't produce false alarms
 
@@ -95,6 +98,14 @@ chmod +x skillsync.py
 # writes a generated inventory of every target skill, including core ports,
 # local skills, vendor skills, archives, duplicates, and symlink rows
 
+./skillsync.py catalog-audit general --strict
+# checks the configured model-visible `general` profile and exits 1 on a
+# configured catalog-budget or metadata violation
+
+./skillsync.py compact-descriptions codex --reviewed
+# shortens only native discovery descriptions in one reviewed target. It never
+# changes the instruction body below the frontmatter.
+
 ./skillsync.py install-hook
 # (git sources only) fires a check automatically on every commit that
 # touches a skill file, instead of waiting for a scheduled run
@@ -143,6 +154,16 @@ chmod +x skillsync.py
   "target_adapters": {
     "codex": { "openai_yaml": true }
   },
+  "catalog_profiles": {
+    "general": {
+      "roots": ["codex"],
+      "max_entries": 48,
+      "max_description_chars": 160,
+      "entry_overhead_tokens": 8,
+      "budget_tokens": 3500,
+      "fail_on_duplicates": true
+    }
+  },
   "webhook_url": null,
   "webhook_keychain": null
 }
@@ -160,6 +181,21 @@ chmod +x skillsync.py
 - `target_adapters`: optional native UI metadata. `openai_yaml` emits only
   Codex's display name, short description, and explicit `$skill` prompt. It
   never adds a tool, MCP, credential, identity, or policy grant.
+- `catalog_profiles`: explicit model-exposure contracts. `roots` can name an
+  existing target, a filesystem path, `{ "name": "...", "path": "..." }`,
+  or `{ "codex_config": "~/.codex/config.toml" }` to resolve only the
+  currently enabled Codex plugin skill roots from its local cache.
+  The audit recursively measures every `SKILL.md` in those roots because that
+  is what native loaders normally see. It never silently deduplicates a
+  catalog for the estimate. Keep the general profile small and use specialist
+  profiles for design, web, finance, and other dense packs. `budget_tokens`
+  is a conservative heuristic, not a claim about a model's hidden context
+  window: `ceil((skill name + separator + capped description) characters / 4)
+  + entry_overhead_tokens` per visible skill. Set `exclude_parts` only when the real loader excludes those
+  path components too. Set `fail_on_metadata` to `false` only for third-party
+  plugin roots whose upstream descriptions you cannot yet change. The audit
+  still reports that drift, but `--strict` will focus on actual admission
+  limits and duplicate-name policy.
 - `webhook_url`: optional. Any endpoint that accepts a JSON POST with a
   `text` field (Slack incoming webhooks, Discord, a custom endpoint, etc.).
   Fired only when real drift is found, and only when `--webhook` is passed.
@@ -215,6 +251,40 @@ duplicate names that could mask a governed port.
 ```
 
 Use this when the problem is catalog visibility rather than drift.
+
+## Catalog budgets and profiles
+
+Skill discovery is not free context. A catalog with a few hundred skills can
+overflow a host's dynamic skills budget even if every individual description
+looks reasonable. When that happens the host may remove descriptions and then
+drop skills entirely. Shorter prose helps, but it cannot compensate for an
+unbounded catalog.
+
+Use `catalog-audit` as the admission check for every model-visible profile:
+
+```bash
+./skillsync.py catalog-audit general --json
+./skillsync.py catalog-audit general --strict
+```
+
+The command is read-only. It does not turn plugins on or off, and it does not
+claim that all host runtimes share the same context limit. Its job is to make
+the exposure contract explicit and fail CI before a configured profile grows
+past its own safe budget. Keep a small general profile always available and
+load specialist packs intentionally. Do not place a vendor package or another
+runtime's embedded `.claude` or `.codex` tree below a recursively discovered
+root unless that duplication is deliberate and budgeted.
+
+When a local target already has sound instruction bodies but bloated or missing
+discovery descriptions, normalize that metadata separately:
+
+```bash
+./skillsync.py compact-descriptions codex --max-chars 160 --reviewed
+```
+
+This is intentionally a reviewed mutation. It changes only the simple YAML
+`description` scalar, adds a safe fallback when it is missing, and leaves each
+skill's instruction body byte-for-byte intact.
 
 ## Upstream proposals
 

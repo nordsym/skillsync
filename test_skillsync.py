@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -233,6 +234,41 @@ class SyncExactTests(unittest.TestCase):
         finally:
             os.chdir(previous)
 
+    def test_compact_descriptions_changes_only_frontmatter_metadata(self):
+        port = self.target / "demo" / "SKILL.md"
+        original_body = "# Demo\n\nInstruction body stays exactly here.\n"
+        port.write_text(
+            "---\nname: demo\ndescription: " + json.dumps("One very long discovery description " * 12) + "\n---\n" + original_body
+        )
+        args = SimpleNamespace(target="test", max_chars=80, reviewed=False, include_unmanaged=True)
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with self.assertRaisesRegex(SystemExit, "requires --reviewed"):
+                skillsync.cmd_compact_descriptions(args)
+            args.reviewed = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                skillsync.cmd_compact_descriptions(args)
+        finally:
+            os.chdir(previous)
+        fields, has_frontmatter = skillsync.parse_frontmatter(port.read_text())
+        self.assertTrue(has_frontmatter)
+        self.assertLessEqual(len(fields["description"]), 80)
+        self.assertTrue(port.read_text().endswith(original_body))
+
+    def test_compact_descriptions_preserves_quoted_json_scalars(self):
+        original_body = "# Demo\n\nBody.\n"
+        source_description = 'Unicode å and a "quoted" capability that must remain valid metadata.'
+        rendered = skillsync.render_compacted_discovery_port(
+            "demo",
+            "---\nname: demo\ndescription: " + json.dumps(source_description, ensure_ascii=False) + "\n---\n" + original_body,
+            160,
+        )
+        fields, has_frontmatter = skillsync.parse_frontmatter(rendered)
+        self.assertTrue(has_frontmatter)
+        self.assertEqual(json.loads(re.search(r"(?m)^description:\s*(.*)$", rendered).group(1)), source_description)
+        self.assertTrue(rendered.endswith(original_body))
+
     def test_check_detects_current_stamp_with_semantic_divergence(self):
         port = self.target / "demo" / "SKILL.md"
         port.write_text(port.read_text() + "Runtime-only instruction.\n")
@@ -324,7 +360,7 @@ class PromotionAndSnapshotTests(unittest.TestCase):
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.4.0")
+        self.assertEqual(skillsync.__version__, "0.5.0")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
@@ -339,6 +375,109 @@ class PublicCliContractTests(unittest.TestCase):
         )
         for command in documented:
             self.assertIn(command, result.stdout)
+
+
+class CatalogAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.catalog = self.root / "catalog"
+        self.catalog.mkdir()
+        self.old_config = skillsync.CONFIG_FILE
+        skillsync.CONFIG_FILE = "skillsync.json"
+
+    def tearDown(self):
+        skillsync.CONFIG_FILE = self.old_config
+        self.tmp.cleanup()
+
+    def write_skill(self, path, name, description):
+        skill = self.catalog / path / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            f"---\nname: {name}\ndescription: {json.dumps(description)}\n---\n# {name}\n"
+        )
+
+    def config(self, **profile):
+        config = {
+            "source_dir": str(self.catalog),
+            "targets": {},
+            "catalog_profiles": {"general": {"roots": [str(self.catalog)], **profile}},
+        }
+        (self.root / "skillsync.json").write_text(json.dumps(config))
+        return config
+
+    def test_catalog_audit_clips_descriptions_for_budget_estimate(self):
+        self.write_skill("alpha", "alpha", "a" * 200)
+        profile = self.config(max_description_chars=40, max_estimated_tokens=1000)
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertEqual(report["metrics"]["entries"], 1)
+        self.assertEqual(report["metrics"]["description_chars"], 200)
+        self.assertEqual(report["metrics"]["rendered_description_chars"], 40)
+        self.assertFalse(report["pass"])
+        self.assertIn("overlong_descriptions", report["violations"]["codes"])
+
+    def test_catalog_audit_can_exclude_nested_skill_trees_when_the_loader_does(self):
+        self.write_skill("alpha", "alpha", "kept")
+        self.write_skill("package/.claude/skills/embedded", "embedded", "ignored")
+        self.write_skill("package/node_modules/vendor", "vendor", "ignored")
+        profile = self.config(exclude_parts=[".claude", "node_modules"])
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertEqual([entry["name"] for entry in report["skills"]], ["alpha"])
+        self.assertEqual(report["metrics"]["ignored"], 2)
+
+    def test_catalog_audit_flags_duplicate_names_and_budget_overflow(self):
+        self.write_skill("one/duplicate", "duplicate", "one")
+        self.write_skill("two/duplicate", "duplicate", "two")
+        profile = self.config(max_entries=1, max_estimated_tokens=1, fail_on_duplicates=True)
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertFalse(report["pass"])
+        self.assertEqual(report["violations"]["duplicate_names"], ["duplicate"])
+        self.assertTrue(report["violations"]["max_entries"])
+        self.assertTrue(report["violations"]["max_estimated_tokens"])
+
+    def test_catalog_audit_counts_visible_skill_names_in_budget(self):
+        long_name = "x" * 40
+        self.write_skill(long_name, long_name, "")
+        profile = self.config(max_description_chars=160, entry_overhead_tokens=0, budget_tokens=10)
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertEqual(report["entries"][0]["rendered_entry_chars"], 42)
+        self.assertTrue(report["summary"]["over_budget"])
+
+    def test_catalog_audit_command_fails_only_when_requested(self):
+        self.write_skill("one", "one", "one")
+        self.write_skill("two", "two", "two")
+        config = self.config(max_entries=1)
+        args = SimpleNamespace(profile="general", json=False, fail_on_budget=False)
+        with patch.object(skillsync, "load_config", return_value=config), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_catalog_audit(args)
+        args.fail_on_budget = True
+        with patch.object(skillsync, "load_config", return_value=config), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            skillsync.cmd_catalog_audit(args)
+
+    def test_catalog_audit_resolves_only_enabled_codex_plugin_skill_roots(self):
+        codex_home = self.root / "codex"
+        cache = codex_home / "plugins" / "cache"
+        config_path = codex_home / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            '[plugins."alpha@provider"]\nenabled = true\n\n'
+            '[plugins."remote@provider"]\nenabled = true\n\n'
+            '[plugins."beta@provider"]\nenabled = false\n\n'
+            '[unrelated]\nenabled = true\n'
+        )
+        enabled = cache / "provider" / "alpha" / "1.0.0" / "skills" / "alpha" / "SKILL.md"
+        remote = cache / "provider-remote" / "remote" / "1.0.0" / "skills" / "remote" / "SKILL.md"
+        disabled = cache / "provider" / "beta" / "1.0.0" / "skills" / "beta" / "SKILL.md"
+        enabled.parent.mkdir(parents=True)
+        remote.parent.mkdir(parents=True)
+        disabled.parent.mkdir(parents=True)
+        enabled.write_text("---\nname: alpha\ndescription: enabled\n---\n# Alpha\n")
+        remote.write_text("---\nname: remote\ndescription: remote\n---\n# Remote\n")
+        disabled.write_text("---\nname: beta\ndescription: disabled\n---\n# Beta\n")
+        profile = self.config(roots=[{"codex_config": str(config_path)}])
+        report = skillsync.catalog_audit(profile, "general")
+        self.assertEqual([entry["name"] for entry in report["entries"]], ["alpha", "remote"])
+        self.assertEqual(report["roots"][0]["root"], "plugin:alpha@provider")
 
 
 class WebhookCredentialTests(unittest.TestCase):

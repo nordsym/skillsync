@@ -24,10 +24,12 @@ What it does mechanically:
   4. Optionally fire a webhook when real drift is found, and optionally
      install a git post-commit hook so drift is caught the moment the
      source changes, not on the next scheduled check.
-  5. Render exact Core ports with minimal portable `name` and `description`
+  5. Audit the actual model-visible skill catalog against an explicit context
+     budget before a runtime silently drops skills.
+  6. Render exact Core ports with minimal portable `name` and `description`
      frontmatter required by native skill loaders. The skill prose stays
      canonical and is never generated or rewritten.
-  6. Learn each target's frontmatter *shape* (not its prose) from the
+  7. Learn each target's frontmatter *shape* (not its prose) from the
      skills already there, and scaffold a draft in that shape for a new
      port, pre-filled with the target's fixed fields and the source's raw
      content for a human/agent to actually adapt. Never auto-stamped, a
@@ -50,6 +52,8 @@ Usage:
   skillsync.py promote-candidate <target> <skill> [--output <path>]
                                                         # read-only local-skill promotion packet
   skillsync.py capability-snapshot [--output <path>]   # generated port-parity snapshot
+  skillsync.py catalog-audit <profile> [--strict]      # model-visible catalog budget check
+  skillsync.py compact-descriptions <target> --reviewed # compact discovery metadata only
   skillsync.py prepare-discovery <skill> --target <target> --reviewed
                                                         # add loader metadata without claiming Core parity
 """
@@ -61,14 +65,17 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+DEFAULT_DISCOVERY_DESCRIPTION_MAX_CHARS = 160
+DEFAULT_CATALOG_ENTRY_OVERHEAD_TOKENS = 8
 PROMOTION_RISK_PATTERNS = {
     "credential-like reference": re.compile(r"(?i)\b(api[_-]?key|secret|token|password|private[_-]?key|keychain)\b"),
     "client-bound reference": re.compile(r"(?i)(^|[ /])0?2\s*-\s*clients?([ /]|$)|\bclient[_ -]?(data|id|secret|token)\b"),
@@ -232,11 +239,11 @@ def stamp_content(text: str, version: str) -> str:
     return marker + strip_vault_wrappers(text)
 
 
-def safe_description(text: str, fallback_name: str) -> str:
+def safe_description(text: str, fallback_name: str, max_chars=DEFAULT_DISCOVERY_DESCRIPTION_MAX_CHARS) -> str:
     """Extract one bounded parser-safe description from canonical prose."""
     _title, description = parse_source_skill(text)
     description = " ".join(description.split()).replace("\x00", "")
-    return (description or f"NordSym Core skill: {fallback_name}.")[:320]
+    return (description or f"NordSym Core skill: {fallback_name}.")[:max_chars]
 
 
 def render_core_port(skill_name: str, source_text: str, version: str) -> str:
@@ -279,6 +286,62 @@ def render_discovery_port(skill_name: str, runtime_text: str) -> str:
         "",
     ])
     return header + runtime_text.lstrip("\n")
+
+
+def compact_discovery_description(description: str, max_chars: int) -> str:
+    """Shorten discovery metadata at a word boundary, never skill prose."""
+    normalized = " ".join(description.split()).replace("\x00", "")
+    if len(normalized) <= max_chars:
+        return normalized
+    clipped = normalized[: max_chars + 1].rsplit(" ", 1)[0].rstrip(" ,;:.-")
+    return clipped or normalized[:max_chars].rstrip()
+
+
+def decode_discovery_description_scalar(raw_value: str) -> str:
+    """Decode only a lossless JSON-style description scalar.
+
+    Most native Codex descriptions are JSON strings, which are valid YAML.
+    Do not guess at broader YAML scalar syntax before a mutating operation.
+    """
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"description is not a valid JSON string: {exc.msg}")
+        if not isinstance(decoded, str):
+            raise ValueError("description JSON value must be a string")
+        return decoded
+    if value.startswith("'") or value.startswith("|") or value.startswith(">"):
+        raise ValueError("description uses unsupported YAML scalar syntax")
+    return value
+
+
+def render_compacted_discovery_port(skill_name: str, runtime_text: str, max_chars: int) -> str:
+    """Replace only a simple YAML ``description`` scalar in a native port."""
+    fields, has_frontmatter = parse_frontmatter(runtime_text)
+    if not has_frontmatter:
+        raise ValueError("Skill has no simple frontmatter")
+    end = runtime_text.find("\n---\n", 4)
+    header = runtime_text[4:end]
+    body = runtime_text[end:]
+    match = re.search(r"(?m)^description:\s*(.*)$", header)
+    if match:
+        description = decode_discovery_description_scalar(match.group(1))
+    else:
+        description = safe_description(runtime_text, skill_name, max_chars)
+    compacted = compact_discovery_description(description, max_chars)
+    rendered_line = f"description: {json.dumps(compacted, ensure_ascii=False)}"
+    if match:
+        header = re.sub(r"(?m)^description:\s*.*$", rendered_line, header)
+    else:
+        lines = header.splitlines()
+        insert_at = next((i + 1 for i, line in enumerate(lines) if line.startswith("name:")), len(lines))
+        lines.insert(insert_at, rendered_line)
+        header = "\n".join(lines)
+    return "---\n" + header + body
 
 
 def render_openai_yaml(skill_name: str, source_text: str) -> str:
@@ -596,6 +659,324 @@ def parse_frontmatter(text: str):
     return fields, True
 
 
+def catalog_profile(config: dict, profile_name: str) -> dict:
+    """Resolve one explicit model-visible catalog profile.
+
+    A catalog profile is deliberately separate from ``targets``. Targets are
+    ports Skillsync manages. A profile states which roots one runtime will
+    actually expose to a model, along with a conservative rendered-list
+    budget. It never enables or disables a host runtime's plugins.
+    """
+    profiles = config.get("catalog_profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError("catalog_profiles must be an object keyed by profile name")
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        known = ", ".join(sorted(profiles)) or "(none configured)"
+        raise ValueError(f"Unknown catalog profile '{profile_name}'. Known: {known}")
+    if not isinstance(profile.get("roots"), list) or not profile["roots"]:
+        raise ValueError(f"Catalog profile '{profile_name}' requires a non-empty roots list")
+    return profile
+
+
+CODEX_PLUGIN_SECTION_RE = re.compile(r'^\[plugins\."([^"\n]+)"\]\s*$')
+
+
+def enabled_codex_plugin_ids(config_path: Path):
+    """Read the small TOML subset needed for Codex plugin enablement.
+
+    Skillsync remains Python 3.9 compatible, so it cannot depend on
+    ``tomllib``. Plugin sections and their boolean ``enabled`` fields are
+    intentionally parsed narrowly rather than claiming general TOML support.
+    """
+    current = None
+    enabled = []
+    for line in config_path.read_text(errors="ignore").splitlines():
+        stripped = line.strip()
+        match = CODEX_PLUGIN_SECTION_RE.match(stripped)
+        if match:
+            current = match.group(1)
+            continue
+        if stripped.startswith("["):
+            current = None
+            continue
+        if current and re.match(r"^enabled\s*=\s*true\s*(?:#.*)?$", stripped, re.IGNORECASE):
+            enabled.append(current)
+    return enabled
+
+
+def codex_plugin_roots(config_path: Path, cache_dir=None):
+    """Resolve enabled Codex plugin skill roots from the local cache.
+
+    A plugin may supply tools without a skill folder. That is not an audit
+    error. A package with multiple cached versions is surfaced as multiple
+    roots because the loader's exact version selection is host-owned and must
+    not be guessed by a catalog guard.
+    """
+    cache = Path(cache_dir).expanduser() if cache_dir else config_path.parent / "plugins" / "cache"
+    roots = []
+    for plugin_id in enabled_codex_plugin_ids(config_path):
+        if "@" not in plugin_id:
+            continue
+        name, provider = plugin_id.rsplit("@", 1)
+        package = cache / provider / name
+        # Desktop-hosted catalogs use a `-remote` cache namespace for the
+        # same configured provider. Prefer the exact namespace if it exists;
+        # only fall back to its remote mirror when the exact package is absent.
+        if not package.is_dir():
+            package = cache / f"{provider}-remote" / name
+        for skill_dir in sorted(package.glob("*/skills")):
+            if skill_dir.is_dir():
+                roots.append({"root": f"plugin:{plugin_id}", "path": skill_dir.resolve()})
+    return roots
+
+
+def catalog_roots(config: dict, profile_name: str):
+    """Return named catalog roots, resolving target names and filesystem paths."""
+    profile = catalog_profile(config, profile_name)
+    roots = []
+    for raw in profile["roots"]:
+        if isinstance(raw, str) and raw in config.get("targets", {}):
+            label, path = raw, config["targets"][raw]
+        elif isinstance(raw, str):
+            label, path = raw, raw
+        elif isinstance(raw, dict) and isinstance(raw.get("codex_config"), str):
+            # Keep the configured lexical parent. Buzz uses a config symlink
+            # whose sibling plugin cache is intentionally different from the
+            # target of that symlink.
+            config_path = Path(raw["codex_config"]).expanduser()
+            if not config_path.is_file():
+                roots.append({"root": f"codex-config:{config_path}", "path": config_path})
+                continue
+            roots.extend(codex_plugin_roots(config_path, raw.get("cache_dir")))
+            continue
+        elif isinstance(raw, dict) and isinstance(raw.get("path"), str):
+            label = raw.get("name") or raw["path"]
+            path = raw["path"]
+        else:
+            raise ValueError(
+                f"Catalog profile '{profile_name}' has an invalid root. "
+                "Use a target name, a path, {name, path}, or {codex_config}."
+            )
+        roots.append({"root": str(label), "path": Path(path).expanduser().resolve()})
+    return roots
+
+
+def description_issue(description: str, has_frontmatter: bool):
+    """Return a loader-metadata issue without pretending to parse full YAML."""
+    if not has_frontmatter or not description:
+        return "missing_description"
+    # The dependency-free frontmatter parser only supports single-line scalar
+    # values. A dangling quote is a strong signal that a multiline YAML value
+    # would otherwise be silently measured as valid metadata.
+    if description.startswith('"') and not description.endswith('"'):
+        return "malformed_description"
+    return None
+
+
+def catalog_audit(config: dict, profile_name: str) -> dict:
+    """Measure a configured model-visible skill catalog without mutating it.
+
+    Catalog token counts are intentionally estimates, not tokenizer claims:
+    every visible description costs ``ceil(chars / 4)`` plus a configurable
+    per-entry envelope. Duplicates are retained in the count because a native
+    loader sees every discovered file before it can decide how to resolve a
+    collision.
+    """
+    profile = catalog_profile(config, profile_name)
+    roots = catalog_roots(config, profile_name)
+    max_description_chars = profile.get(
+        "max_description_chars", DEFAULT_DISCOVERY_DESCRIPTION_MAX_CHARS
+    )
+    entry_overhead_tokens = profile.get(
+        "entry_overhead_tokens", DEFAULT_CATALOG_ENTRY_OVERHEAD_TOKENS
+    )
+    budget_tokens = profile.get("budget_tokens", profile.get("max_estimated_tokens"))
+    max_entries = profile.get("max_entries")
+    fail_on_duplicates = profile.get("fail_on_duplicates", True)
+    fail_on_metadata = profile.get("fail_on_metadata", True)
+    excluded_parts = profile.get("exclude_parts", [])
+    if not isinstance(max_description_chars, int) or max_description_chars < 1:
+        raise ValueError("max_description_chars must be a positive integer")
+    if not isinstance(entry_overhead_tokens, int) or entry_overhead_tokens < 0:
+        raise ValueError("entry_overhead_tokens must be a non-negative integer")
+    for field, value in (("budget_tokens", budget_tokens), ("max_entries", max_entries)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"{field} must be a non-negative integer")
+    if not isinstance(fail_on_duplicates, bool) or not isinstance(fail_on_metadata, bool):
+        raise ValueError("fail_on_duplicates and fail_on_metadata must be booleans")
+    if not isinstance(excluded_parts, list) or not all(isinstance(part, str) and part for part in excluded_parts):
+        raise ValueError("exclude_parts must be a list of non-empty path components")
+
+    entries = []
+    root_rows = []
+    missing_roots = []
+    ignored = 0
+    for root in roots:
+        path = root["path"]
+        exists = path.is_dir()
+        root_rows.append({"root": root["root"], "path": str(path), "exists": exists})
+        if not exists:
+            missing_roots.append(root["root"])
+            continue
+        for skill_file in sorted(path.rglob("SKILL.md")):
+            if not skill_file.is_file():
+                continue
+            relative_path = skill_file.relative_to(path)
+            if any(part in excluded_parts for part in relative_path.parts[:-1]):
+                ignored += 1
+                continue
+            raw = skill_file.read_text(errors="ignore")
+            fields, has_frontmatter = parse_frontmatter(raw)
+            name = fields.get("name") or skill_file.parent.name
+            description = fields.get("description", "")
+            issue = description_issue(description, has_frontmatter)
+            description_chars = len(description)
+            description_tokens = (description_chars + 3) // 4
+            render_description_chars = min(description_chars, max_description_chars)
+            # Native catalogs at minimum include a skill name and a separator
+            # beside discovery metadata. Count that actual visible payload
+            # instead of relying on the fixed overhead to hide long names.
+            rendered_entry_chars = len(name) + 2 + render_description_chars
+            render_tokens = (rendered_entry_chars + 3) // 4 + entry_overhead_tokens
+            issues = [issue] if issue else []
+            if description_chars > max_description_chars:
+                issues.append("description_too_long")
+            entries.append({
+                "name": name,
+                "path": str(skill_file),
+                "relative_path": str(relative_path),
+                "root": root["root"],
+                "description_chars": description_chars,
+                "rendered_description_chars": render_description_chars,
+                "rendered_entry_chars": rendered_entry_chars,
+                "description_tokens_estimate": description_tokens,
+                "render_tokens_estimate": render_tokens,
+                "issues": issues,
+            })
+
+    entries.sort(key=lambda entry: (entry["name"], entry["root"], entry["relative_path"]))
+    by_name = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], []).append(entry)
+    duplicates = [
+        {"name": name, "entries": [{"root": entry["root"], "path": entry["path"]} for entry in matches]}
+        for name, matches in sorted(by_name.items()) if len(matches) > 1
+    ]
+    duplicate_names = [item["name"] for item in duplicates]
+    missing_description_count = sum("missing_description" in entry["issues"] for entry in entries)
+    malformed_description_count = sum("malformed_description" in entry["issues"] for entry in entries)
+    overlong_description_count = sum("description_too_long" in entry["issues"] for entry in entries)
+    description_chars = sum(entry["description_chars"] for entry in entries)
+    rendered_description_chars = sum(entry["rendered_description_chars"] for entry in entries)
+    rendered_entry_chars = sum(entry["rendered_entry_chars"] for entry in entries)
+    description_tokens_estimate = sum(entry["description_tokens_estimate"] for entry in entries)
+    catalog_tokens_estimate = sum(entry["render_tokens_estimate"] for entry in entries)
+    over_budget = budget_tokens is not None and catalog_tokens_estimate > budget_tokens
+    over_entry_limit = max_entries is not None and len(entries) > max_entries
+    codes = []
+    if missing_roots:
+        codes.append("missing_roots")
+    if duplicate_names and fail_on_duplicates:
+        codes.append("duplicate_names")
+    if fail_on_metadata:
+        if missing_description_count:
+            codes.append("missing_descriptions")
+        if malformed_description_count:
+            codes.append("malformed_descriptions")
+        if overlong_description_count:
+            codes.append("overlong_descriptions")
+    if over_entry_limit:
+        codes.append("max_entries")
+    if over_budget:
+        codes.append("budget_tokens")
+
+    summary = {
+        "entries": len(entries),
+        "unique_names": len(by_name),
+        "description_chars": description_chars,
+        "rendered_description_chars": rendered_description_chars,
+        "rendered_entry_chars": rendered_entry_chars,
+        "description_tokens_estimate": description_tokens_estimate,
+        "entry_overhead_tokens": entry_overhead_tokens,
+        "entry_overhead_tokens_estimate": len(entries) * entry_overhead_tokens,
+        "catalog_tokens_estimate": catalog_tokens_estimate,
+        "budget_tokens": budget_tokens,
+        "budget_ratio": (catalog_tokens_estimate / budget_tokens) if budget_tokens else None,
+        "over_budget": over_budget,
+        "over_entry_limit": over_entry_limit,
+        "missing_description_count": missing_description_count,
+        "malformed_description_count": malformed_description_count,
+        "overlong_description_count": overlong_description_count,
+        "duplicate_name_count": len(duplicate_names),
+        "ignored": ignored,
+    }
+    return {
+        "schema": "skillsync-catalog-audit/v1",
+        "profile": profile_name,
+        "roots": root_rows,
+        "policy": {
+            "estimator": "ceil((skill_name_chars + separator + capped_description_chars) / 4) + entry_overhead_tokens per visible skill",
+            "max_description_chars": max_description_chars,
+            "entry_overhead_tokens": entry_overhead_tokens,
+            "budget_tokens": budget_tokens,
+            "max_entries": max_entries,
+            "fail_on_duplicates": fail_on_duplicates,
+            "fail_on_metadata": fail_on_metadata,
+            "exclude_parts": excluded_parts,
+        },
+        "summary": summary,
+        # ``metrics`` and ``skills`` retain a simple stable shape for scripts
+        # that adopted the initial 0.5.0 preview API.
+        "metrics": summary,
+        "duplicates": duplicates,
+        "violations": {
+            "codes": codes,
+            "missing_roots": missing_roots,
+            "duplicate_names": duplicate_names,
+            "max_entries": over_entry_limit,
+            "max_estimated_tokens": over_budget,
+            "budget_tokens": over_budget,
+        },
+        "pass": not codes,
+        "entries": entries,
+        "skills": entries,
+    }
+
+
+def render_catalog_audit(report: dict) -> str:
+    """Render a concise human report. JSON remains available for CI."""
+    summary = report["summary"]
+    state = "PASS" if report["pass"] else "FAIL"
+    lines = [
+        "skillsync catalog audit",
+        f"Profile: {report['profile']}",
+        f"Result: {state}",
+        f"Visible skills: {summary['entries']} ({summary['unique_names']} unique names)",
+        f"Estimated catalog tokens: {summary['catalog_tokens_estimate']}"
+        + (f" / {summary['budget_tokens']}" if summary["budget_tokens"] is not None else ""),
+        f"Description cap: {report['policy']['max_description_chars']} chars",
+        f"Duplicate names: {summary['duplicate_name_count']}",
+    ]
+    if report["violations"]["codes"]:
+        lines.append("Violations: " + ", ".join(report["violations"]["codes"]))
+    return "\n".join(lines) + "\n"
+
+
+def cmd_catalog_audit(args):
+    config = load_config()
+    try:
+        report = catalog_audit(config, args.profile)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(render_catalog_audit(report), end="")
+    if (getattr(args, "strict", False) or getattr(args, "fail_on_budget", False)) and not report["pass"]:
+        sys.exit(1)
+
+
 def learn_format(target_dir: str) -> dict:
     """Infer a target's frontmatter shape from the skills already ported
     there: does it use frontmatter at all, which fields recur, and what
@@ -750,6 +1131,16 @@ def cmd_init(args):
                 "codex": "~/.codex/skills",
                 "agents": "~/.agents/skills",
             },
+            "catalog_profiles": {
+                "general": {
+                    "roots": ["codex"],
+                    "max_entries": 48,
+                    "max_description_chars": 160,
+                    "entry_overhead_tokens": 8,
+                    "budget_tokens": 3500,
+                    "fail_on_duplicates": True,
+                }
+            },
             "webhook_url": None,
         }
     )
@@ -862,6 +1253,54 @@ def cmd_prepare_discovery(args):
         sys.exit(str(exc))
     dest.write_text(rendered)
     print(f"PREPARED {args.target}:{args.skill} for native discovery (semantic parity remains unreviewed)")
+
+
+def cmd_compact_descriptions(args):
+    """Compact native discovery metadata in one reviewed target, never bodies."""
+    if not args.reviewed:
+        sys.exit("compact-descriptions requires --reviewed because it changes runtime discovery metadata")
+    config = load_config()
+    if args.target not in config["targets"]:
+        sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
+    max_chars = args.max_chars
+    if max_chars < 1:
+        sys.exit("--max-chars must be a positive integer")
+    target = Path(config["targets"][args.target]).expanduser()
+    managed = config.get("managed_roots", {}).get(args.target)
+    if managed:
+        scan_root = Path(managed).expanduser()
+    elif getattr(args, "include_unmanaged", False):
+        scan_root = target
+    else:
+        sys.exit(
+            "compact-descriptions only changes a configured managed_root by default. "
+            "Use --include-unmanaged after reviewing a full target tree."
+        )
+    changed = skipped = 0
+    skipped_paths = []
+    for skill_file in sorted(scan_root.rglob("SKILL.md")):
+        raw = skill_file.read_text(errors="ignore")
+        try:
+            rendered = render_compacted_discovery_port(skill_file.parent.name, raw, max_chars)
+        except ValueError as exc:
+            skipped += 1
+            skipped_paths.append(f"{skill_file}: {exc}")
+            continue
+        if rendered != raw:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=skill_file.parent,
+                prefix=f".{skill_file.name}.", suffix=".tmp", delete=False,
+            ) as replacement:
+                replacement.write(rendered)
+                replacement_path = Path(replacement.name)
+            replacement_path.replace(skill_file)
+            changed += 1
+    print(
+        f"COMPACTED {changed} discovery description(s) in {scan_root}; "
+        f"skipped {skipped} skill(s). Instruction bodies were unchanged."
+    )
+    for skipped_path in skipped_paths:
+        print(f"SKIPPED {skipped_path}")
 
 
 def cmd_check(args):
@@ -1219,6 +1658,13 @@ def main():
     p_prepare.add_argument("--reviewed", action="store_true", help="confirm the local adaptation was reviewed")
     p_prepare.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
 
+    p_compact = sub.add_parser("compact-descriptions", help="compact native discovery metadata without changing skill instruction bodies")
+    p_compact.add_argument("target", help="runtime target whose local skill descriptions are reviewed")
+    p_compact.add_argument("--max-chars", type=int, default=DEFAULT_DISCOVERY_DESCRIPTION_MAX_CHARS, help="maximum discovery-description length (default: 160)")
+    p_compact.add_argument("--reviewed", action="store_true", help="confirm the target metadata was reviewed for compaction")
+    p_compact.add_argument("--include-unmanaged", action="store_true", help="allow a reviewed full-target metadata pass when no managed_root is configured")
+    p_compact.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
+
     p_check = sub.add_parser("check", help="report missing/stale ports")
     p_check.add_argument("skill", nargs="?", help="check only this skill")
     p_check.add_argument("--fail-on-drift", action="store_true", help="exit 1 if anything is out of sync")
@@ -1227,6 +1673,12 @@ def main():
 
     p_registry = sub.add_parser("registry", help="emit a generated inventory of all target skills")
     p_registry.add_argument("--output", help="write markdown to this path instead of stdout")
+
+    p_catalog = sub.add_parser("catalog-audit", help="measure a model-visible skill catalog against an explicit context budget")
+    p_catalog.add_argument("profile", help="catalog_profiles entry to audit")
+    p_catalog.add_argument("--json", action="store_true", help="emit the machine-readable audit report")
+    p_catalog.add_argument("--strict", action="store_true", help="exit 1 for any configured catalog-policy violation")
+    p_catalog.add_argument("--config", help="path to a specific skillsync.json (default: ./skillsync.json)")
 
     sub.add_parser("install-hook", help="install a git post-commit hook in the source repo")
 
@@ -1266,8 +1718,10 @@ def main():
         "stamp": cmd_stamp,
         "sync-exact": cmd_sync_exact,
         "prepare-discovery": cmd_prepare_discovery,
+        "compact-descriptions": cmd_compact_descriptions,
         "check": cmd_check,
         "registry": cmd_registry,
+        "catalog-audit": cmd_catalog_audit,
         "install-hook": cmd_install_hook,
         "learn-format": cmd_learn_format,
         "scaffold": cmd_scaffold,
