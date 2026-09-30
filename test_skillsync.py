@@ -360,7 +360,7 @@ class PromotionAndSnapshotTests(unittest.TestCase):
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.8.0")
+        self.assertEqual(skillsync.__version__, "0.8.1")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
@@ -776,13 +776,38 @@ class BundleSyncTests(unittest.TestCase):
         self.assertEqual(self.sync()['summary']['conflict'], 1)
         self.assertTrue((self.target / 'demo').is_symlink())
 
-    def test_overlap_symlink_root_and_malformed_state_fail_closed(self):
+    def test_configured_data_root_alias_is_pinned_and_syncs_losslessly(self):
+        data = self.root / 'sand-data'
+        (data / 'workflows').mkdir(parents=True)
+        alias = self.root / 'agent-data'
+        alias.symlink_to(data, target_is_directory=True)
+        skill = self.skill(data / 'workflows')
+        report = skillsync.sync_bundles(self.source, alias / 'workflows', 'grokbot')
+        self.assertEqual(report['summary']['added'], 1)
+        self.assertEqual(skillsync.bundle_root(alias / 'workflows'), data / 'workflows')
+        self.assertEqual((self.source / 'demo/SKILL.md').read_bytes(), skill.read_bytes())
+        # The resolved and aliased spelling share the same baseline.
+        (self.source / 'demo/SKILL.md').write_bytes(b'repo update')
+        skillsync.sync_bundles(self.source, data / 'workflows', 'grokbot')
+        self.assertEqual(skill.read_bytes(), b'repo update')
+
+    def test_configured_alias_cannot_hide_or_escape_readonly_root(self):
+        for name in ('.cursor', 'plugins'):
+            readonly = self.root / name / 'skills'
+            readonly.mkdir(parents=True)
+            alias = self.root / ('alias-' + name)
+            alias.symlink_to(readonly, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'read-only'):
+                skillsync.sync_bundles(self.source, alias, 'grokbot')
+            # A prohibited requested path remains prohibited even if it resolves outside it.
+            escape = readonly / 'escape'
+            escape.symlink_to(self.target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'read-only'):
+                skillsync.sync_bundles(self.source, escape, 'grokbot')
+
+    def test_overlap_and_malformed_state_fail_closed(self):
         with self.assertRaisesRegex(ValueError, 'overlap'):
             skillsync.sync_bundles(self.source, self.repo, 'grokbot')
-        alias = self.root / 'alias'
-        alias.symlink_to(self.target, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, 'symlink'):
-            skillsync.sync_bundles(self.source, alias, 'grokbot')
         state = skillsync.bundle_state_path(self.source, self.target, 'grokbot')
         state.parent.mkdir(parents=True)
         state.write_text('{"demo": "not a hash"}')

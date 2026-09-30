@@ -358,7 +358,10 @@ Grok Bot's user-created skills live on its Linux box at
 your Mac. The `grokbot` target defaults to that directory; configure
 `targets.grokbot` or pass `--target-dir` to override it. Cursor-managed skills
 and plugin skills are read-only and must stay outside the configured root.
-Symlinked skills and read-only folders are skipped rather than followed or written.
+The explicitly configured root is resolved once, so Grok Bot's
+`/home/box/agent-data` alias to `/home/box/sand-data` works. Both the requested and
+resolved roots must be outside Cursor/plugin directories. Symlinked individual
+skills or helpers and read-only folders are skipped rather than followed or written.
 
 Use the new `sync` command for Agent Skills folders. It copies `SKILL.md`, all
 helper files and `LICENSE` as raw bytes, including every frontmatter key. It does
@@ -373,7 +376,7 @@ Debian/Ubuntu). Node and npm are not required. Download the released CLI:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-curl -fL https://raw.githubusercontent.com/nordsym/skillsync/v0.8.0/skillsync.py \
+curl -fL https://raw.githubusercontent.com/nordsym/skillsync/v0.8.1/skillsync.py \
   -o "$HOME/.local/bin/skillsync.py"
 ```
 
