@@ -350,3 +350,114 @@ not a missing feature.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Grok Bot: bidirectional skill-folder sync
+
+Grok Bot's user-created skills live on its Linux box at
+`/home/box/agent-data/workflows/<slug>/SKILL.md`. This is a separate machine from
+your Mac. The `grokbot` target defaults to that directory; configure
+`targets.grokbot` or pass `--target-dir` to override it. Cursor-managed skills
+and plugin skills are read-only and must stay outside the configured root.
+Symlinked skills and read-only folders are skipped rather than followed or written.
+
+Use the new `sync` command for Agent Skills folders. It copies `SKILL.md`, all
+helper files and `LICENSE` as raw bytes, including every frontmatter key. It does
+not add stamps, strip YAML or translate prose. Legacy flat `skills/<name>.md`
+Core ports continue using the existing `sync-exact` workflow. Bundle skills use
+`source_dir/<slug>/SKILL.md` in the same configured source directory.
+
+### Fresh Linux box setup
+
+Install Python 3.9+ and Git (for example `sudo apt-get install python3 git` on
+Debian/Ubuntu). Node and npm are not required. Download the released CLI:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -fL https://raw.githubusercontent.com/nordsym/skillsync/v0.8.0/skillsync.py \
+  -o "$HOME/.local/bin/skillsync.py"
+```
+
+Create a **private skill-data repository** on GitHub with an initial commit and
+clone the same repository on the box and Mac. Do not push personal skills to the
+public `nordsym/skillsync` software repository. A dedicated sync branch is also
+supported through normal Git branch tracking.
+
+For a private repository, create a fine-grained GitHub token restricted to that
+repository with **Contents: read and write**. Set `SKILLSYNC_GIT_TOKEN` through
+your secret manager or a hidden prompt; do not put it in the remote URL, config,
+command history or committed files. Git authentication stays with Git:
+
+```bash
+mkdir -p "$HOME/.local/libexec"
+cat > "$HOME/.local/libexec/skillsync-git-askpass" <<'SH'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *Password*) printf '%s\n' "$SKILLSYNC_GIT_TOKEN" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod 700 "$HOME/.local/libexec/skillsync-git-askpass"
+export GIT_ASKPASS="$HOME/.local/libexec/skillsync-git-askpass"
+export GIT_TERMINAL_PROMPT=0
+# SKILLSYNC_GIT_TOKEN must already be present in the environment.
+git clone https://github.com/YOUR-ACCOUNT/YOUR-PRIVATE-SKILLS.git "$HOME/skills-sync"
+cd "$HOME/skills-sync"
+git config user.name 'Grok Bot skill sync'
+git config user.email 'YOUR-GIT-COMMIT-EMAIL'
+mkdir -p skills
+cat > skillsync.json <<'JSON'
+{
+  "source_dir": "./skills",
+  "targets": {
+    "grokbot": "/home/box/agent-data/workflows"
+  }
+}
+JSON
+```
+
+Keep each machine's config local: add `skillsync.json` to this data repository's
+`.gitignore` and commit that ignore rule before using `--git`. The command
+resolves relative paths against the config file's directory.
+
+### Exact box command
+
+```bash
+python3 "$HOME/.local/bin/skillsync.py" sync --target grokbot --git \
+  --config "$HOME/skills-sync/skillsync.json"
+```
+
+Run the same command with `--dry-run` first to preview local changes. Dry-run
+never pulls, commits, pushes or writes; fetch/pull manually first if you need a
+preview against the latest remote revision. `--direction import` selects box to
+repo, `--direction export` selects repo to box; the default reconciles both.
+The summary reports added, changed, skipped and conflicting skills. Conflicts
+produce a nonzero exit status and leave the conflicting copies untouched.
+
+`--git` uses the source repository's configured upstream: it requires a clean
+working tree, fast-forward pulls, syncs, commits only imported skill-folder
+changes and pushes. It never force-pushes, rebases or stashes unrelated work.
+A push failure leaves a recoverable local commit. Resolve the Git problem and
+run `git push` in the data checkout before rerunning sync; `--git` refuses
+unpublished local commits. A conflict must be resolved deliberately by making the two skill
+folders identical, then rerunning sync. There is no force-overwrite flag.
+
+Each clone keeps its own last successful content hashes outside tracked skill
+content. On the first run, differing copies conflict rather than guessing which
+is newer. On subsequent runs, one-sided edits propagate; edits on both sides
+conflict. Git timestamps are never used as proof of freshness. Removing a whole
+skill on one side does not delete the other copy automatically.
+
+On the Mac, use the same private data remote and configure a narrow user-owned
+local skill root as another existing `targets` entry, for example:
+
+```json
+{
+  "source_dir": "./skills",
+  "targets": { "agents": "~/.agents/skills/my-synced-skills" }
+}
+```
+
+Then run `python3 "$HOME/.local/bin/skillsync.py" sync --target agents --git
+--config "$HOME/skills-sync/skillsync.json"` as one shell line. Only that explicit
+root participates; installed plugin or Cursor caches are not sync destinations.

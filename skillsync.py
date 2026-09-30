@@ -65,8 +65,10 @@ import difflib
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -74,7 +76,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.6.0"
+__version__ = "0.8.0"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -1137,6 +1139,8 @@ def render_catalog_router(profile_name: str, command: str, config_path: Path) ->
 def cmd_install_catalog_router(args):
     if not args.reviewed:
         sys.exit("install-catalog-router requires --reviewed because it creates a model-visible router skill")
+    if args.target == "grokbot":
+        sys.exit("grokbot requires lossless 'sync --target grokbot'; legacy rendering is disabled")
     config = load_config()
     targets = {**config.get("targets", {}), **config.get("catalog_router_targets", {})}
     if args.target not in targets:
@@ -1247,6 +1251,8 @@ def parse_source_skill(text: str):
 
 
 def cmd_scaffold(args):
+    if args.target == "grokbot":
+        sys.exit("grokbot requires lossless 'sync --target grokbot'; legacy rendering is disabled")
     config = load_config()
     source_dir = Path(config["source_dir"]).expanduser().resolve()
     src = source_dir / f"{args.skill}.md"
@@ -1309,6 +1315,7 @@ def cmd_init(args):
                 "claude": "~/.claude/skills",
                 "codex": "~/.codex/skills",
                 "agents": "~/.agents/skills",
+                "grokbot": "/home/box/agent-data/workflows",
             },
             "catalog_profiles": {
                 "general": {
@@ -1352,6 +1359,9 @@ def cmd_stamp(args):
         name = skill_file.stem
         version = source_version(source_dir, skill_file)
         for target_name, target_dir in config["targets"].items():
+            if target_name == "grokbot":
+                print("SKIPPED  grokbot (use lossless sync --target grokbot)")
+                continue
             dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
                 print(f"MISSING  {target_name}:{name} (not stamped, port does not exist)")
@@ -1385,6 +1395,9 @@ def cmd_sync_exact(args):
         version = source_version(source_dir, skill_file)
         canonical = render_core_port(name, skill_file.read_text(), version)
         for target_name, target_dir in config["targets"].items():
+            if target_name == "grokbot":
+                print("SKIPPED  grokbot (use lossless sync --target grokbot)")
+                continue
             dest = target_file(managed_target_dir(config, target_name), name)
             if not dest.exists():
                 if not getattr(args, "create_missing", False):
@@ -1428,6 +1441,8 @@ def cmd_prepare_discovery(args):
     """Safely make one reviewed local adaptation visible to native loaders."""
     if not args.reviewed:
         sys.exit("prepare-discovery requires --reviewed because it changes a runtime port")
+    if args.target == "grokbot":
+        sys.exit("grokbot requires lossless 'sync --target grokbot'; legacy rendering is disabled")
     config = load_config()
     if args.target not in config["targets"]:
         sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
@@ -1448,6 +1463,8 @@ def cmd_compact_descriptions(args):
     """Compact native discovery metadata in one reviewed target, never bodies."""
     if not args.reviewed:
         sys.exit("compact-descriptions requires --reviewed because it changes runtime discovery metadata")
+    if args.target == "grokbot":
+        sys.exit("grokbot requires lossless 'sync --target grokbot'; legacy rendering is disabled")
     config = load_config()
     if args.target not in config["targets"]:
         sys.exit(f"Unknown target '{args.target}'. Known: {', '.join(config['targets'])}")
@@ -1824,12 +1841,257 @@ def cmd_install_hook(args):
     print("Any commit touching a skill file now triggers an immediate check.")
 
 
+# Lossless folder synchronization is separate from prose porting: it never
+# parses/reformats frontmatter, stamps a body, or scans runtime plugin roots.
+READ_ONLY_SKILL_PARTS = {'.cursor', 'plugins', '.plugins', 'node_modules'}
+
+
+def bundle_root(path):
+    path = Path(os.path.abspath(str(Path(path).expanduser())))
+    if any(part in READ_ONLY_SKILL_PARTS for part in path.parts):
+        raise ValueError('Cursor/plugin-managed skill roots are read-only')
+    if any(parent.is_symlink() for parent in [path, *path.parents]):
+        raise ValueError('Skill root must not traverse a symlink')
+    if path.exists() and not path.is_dir():
+        raise ValueError('Skill root must be a directory')
+    return path
+
+
+def bundle_snapshot(folder):
+    """Hash paths, bytes and executable bits, including all helper files."""
+    if not folder.exists():
+        return None
+    if folder.is_symlink() or not folder.is_dir():
+        raise ValueError('Skill folder is not a regular directory')
+    digest = hashlib.sha256()
+    for current, dirs, files in os.walk(folder, followlinks=False):
+        for name in sorted(dirs + files):
+            item = Path(current) / name
+            if item.is_symlink():
+                raise ValueError('Skill contains a symlink')
+            if not item.stat().st_mode & 0o222:
+                raise ValueError('Skill contains a read-only file or directory')
+            if not item.is_dir() and not item.is_file():
+                raise ValueError('Skill contains a special file')
+        dirs.sort()
+        for name in sorted(dirs):
+            rel = (Path(current) / name).relative_to(folder).as_posix()
+            digest.update(b'D' + rel.encode() + b'\0')
+        for name in sorted(files):
+            item = Path(current) / name
+            rel = item.relative_to(folder).as_posix()
+            content = item.read_bytes()
+            digest.update(b'F' + rel.encode() + b'\0')
+            digest.update(str(item.stat().st_mode & 0o111).encode() + b'\0')
+            digest.update(str(len(content)).encode() + b'\0' + content)
+    return digest.hexdigest()
+
+
+def bundle_inventory(root):
+    bundles, blocked, skipped = {}, set(), []
+    if not root.exists():
+        return bundles, blocked, skipped
+    for child in sorted(root.iterdir()):
+        if child.name.startswith('.') or child.name in READ_ONLY_SKILL_PARTS:
+            skipped.append({'skill': child.name, 'status': 'skipped', 'reason': 'read-only or hidden entry'})
+            blocked.add(child.name)
+            continue
+        if not SKILL_NAME_RE.fullmatch(child.name):
+            continue
+        if child.is_symlink():
+            blocked.add(child.name)
+            skipped.append({'skill': child.name, 'status': 'skipped', 'reason': 'symlink'})
+            continue
+        if not child.is_dir():
+            continue  # Existing flat .md Core files belong to sync-exact.
+        try:
+            if not child.stat().st_mode & 0o222:
+                raise ValueError('read-only skill directory')
+            fingerprint = bundle_snapshot(child)
+            if not (child / 'SKILL.md').is_file():
+                raise ValueError('directory has no SKILL.md')
+            bundles[child.name] = fingerprint
+        except ValueError as exc:
+            blocked.add(child.name)
+            skipped.append({'skill': child.name, 'status': 'skipped', 'reason': str(exc)})
+    return bundles, blocked, skipped
+
+
+def bundle_state_path(source, target, target_name):
+    if not SKILL_NAME_RE.fullmatch(target_name):
+        raise ValueError('Target name must be a simple filename stem')
+    root = git_root(source if source.exists() else source.parent)
+    if root is None or not source.is_relative_to(root):
+        raise ValueError('sync requires source_dir inside a Git checkout')
+    result = subprocess.run(['git', 'rev-parse', '--absolute-git-dir'], cwd=root,
+                            capture_output=True, text=True, check=True)
+    key = hashlib.sha256((str(source) + '\0' + str(target)).encode()).hexdigest()[:16]
+    return Path(result.stdout.strip()) / 'skillsync' / f'{target_name}-{key}.json'
+
+
+def replace_bundle(origin, destination, expected_origin, expected_destination):
+    """Stage a full copy and retain the old folder until replacement succeeds."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.skillsync-', dir=destination.parent))
+    incoming, backup = staging / 'incoming', staging / 'backup'
+    try:
+        shutil.copytree(origin, incoming, copy_function=shutil.copy2)
+        if (bundle_snapshot(incoming) != expected_origin or
+                bundle_snapshot(origin) != expected_origin or
+                bundle_snapshot(destination) != expected_destination):
+            raise ValueError('Skill changed during sync; rerun to reconcile')
+        if destination.exists():
+            os.replace(destination, backup)
+        try:
+            os.replace(incoming, destination)
+        except OSError:
+            if backup.exists():
+                os.replace(backup, destination)
+            raise
+    finally:
+        shutil.rmtree(staging)
+
+
+def sync_bundles(source, target, target_name, direction='both', dry_run=False):
+    source, target = bundle_root(source), bundle_root(target)
+    if source == target or source in target.parents or target in source.parents:
+        raise ValueError('Source and target skill roots must not overlap')
+    state_path = bundle_state_path(source, target, target_name)
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if not isinstance(state, dict) or any(not isinstance(k, str) or not SKILL_NAME_RE.fullmatch(k) or not isinstance(v, str)
+                                          or not re.fullmatch('[0-9a-f]{64}', v) for k, v in state.items()):
+        raise ValueError('Invalid sync baseline; refusing to guess')
+    repo, local, repo_blocked, local_blocked = {}, {}, set(), set()
+    repo, repo_blocked, repo_skips = bundle_inventory(source)
+    local, local_blocked, local_skips = bundle_inventory(target)
+    entries = repo_skips + local_skips
+    for name in sorted(set(repo) | set(local) | set(state)):
+        left, right, base = repo.get(name), local.get(name), state.get(name)
+        action, reason = None, ''
+        if name in repo_blocked or name in local_blocked:
+            status, reason = 'conflict', 'unsafe or read-only counterpart'
+        elif (source / f'{name}.md').exists():
+            status, reason = 'conflict', 'name collides with a legacy flat Core skill'
+        elif left == right:
+            status, reason = 'skipped', 'already identical'
+            if left is not None:
+                state[name] = left
+        elif base is None and left is None:
+            action = 'import'
+        elif base is None and right is None:
+            action = 'export'
+        elif left is None or right is None:
+            status, reason = 'conflict', 'previously synced skill is missing; deletion requires manual resolution'
+        elif right == base and left != base:
+            action = 'export'
+        elif left == base and right != base:
+            action = 'import'
+        else:
+            status, reason = 'conflict', 'both copies changed or no common baseline'
+        if action:
+            if direction not in ('both', action):
+                status, reason = 'skipped', f'{action} excluded by direction'
+            else:
+                origin, dest = (target / name, source / name) if action == 'import' else (source / name, target / name)
+                original, previous = (right, left) if action == 'import' else (left, right)
+                status = 'added' if previous is None else 'changed'
+                if not dry_run:
+                    try:
+                        replace_bundle(origin, dest, original, previous)
+                    except ValueError as exc:
+                        status, reason = 'conflict', str(exc)
+                    else:
+                        state[name] = original
+        entry = {'skill': name, 'status': status}
+        if action:
+            entry['direction'] = action
+        if reason:
+            entry['reason'] = reason
+        entries.append(entry)
+    if not dry_run:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile('w', dir=state_path.parent, delete=False) as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            temporary = handle.name
+        os.replace(temporary, state_path)
+    return {'target': target_name, 'dry_run': dry_run, 'entries': entries,
+            'summary': {status: sum(e['status'] == status for e in entries)
+                        for status in ('added', 'changed', 'skipped', 'conflict')}}
+
+
+def sync_git(root, *arguments):
+    result = subprocess.run(['git', *arguments], cwd=root, capture_output=True, text=True)
+    if result.returncode:
+        # Git stderr can echo a remote URL containing credentials.
+        raise ValueError(f'git {arguments[0]} failed; local changes and commits are preserved')
+    return result.stdout.strip()
+
+
+def cmd_sync(args):
+    config_path = Path(CONFIG_FILE).expanduser().absolute()
+    config = load_config()
+    targets = config.get('targets', {})
+    if args.target not in targets and args.target != 'grokbot':
+        sys.exit(f'Unknown target: {args.target}')
+    def anchored(raw):
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else config_path.parent / path
+    try:
+        source = bundle_root(anchored(config['source_dir']))
+        target = bundle_root(anchored(args.target_dir or targets.get(args.target, '/home/box/agent-data/workflows')))
+        root = git_root(source if source.exists() else source.parent)
+        if args.git and not args.dry_run:
+            if root is None:
+                raise ValueError('--git requires a Git checkout')
+            if sync_git(root, 'status', '--porcelain'):
+                raise ValueError('--git requires a clean checkout; commit or resolve your changes first')
+            ahead = sync_git(root, 'rev-list', '--count', '@{upstream}..HEAD')
+            if ahead != '0':
+                raise ValueError('--git refuses unpublished commits; push or resolve them explicitly first')
+            sync_git(root, 'pull', '--ff-only')
+        report = sync_bundles(source, target, args.target, args.direction, dry_run=True)
+        # After pulling, conflicts prevent any sync writes or publication.
+        if not args.dry_run and not (args.git and report['summary']['conflict']):
+            report = sync_bundles(source, target, args.target, args.direction)
+            if args.git and not report['summary']['conflict']:
+                paths = [str((source / e['skill']).relative_to(root)) for e in report['entries']
+                         if e['status'] in ('added', 'changed') and e.get('direction') == 'import']
+                if paths:
+                    sync_git(root, 'add', '--', *paths)
+                    sync_git(root, 'commit', '-m', f'sync: import {args.target} skill bundles', '--', *paths)
+                    sync_git(root, 'push')
+        report['git'] = 'dry-run: no pull, commit or push' if args.git and args.dry_run else bool(args.git)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            for entry in report['entries']:
+                print(f"{entry['status'].upper():8} {entry['skill']} {entry.get('direction', '')} {entry.get('reason', '')}".rstrip())
+            print(('Dry run: ' if report['dry_run'] else 'Summary: ') + ', '.join(
+                f'{count} {status}' for status, count in report['summary'].items()))
+            if args.git and args.dry_run:
+                print(report['git'])
+        if report['summary']['conflict']:
+            sys.exit(1)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        sys.exit(str(exc))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"skillsync {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="write a starter skillsync.json in the current directory")
+
+    p_bundle_sync = sub.add_parser("sync", help="lossless bidirectional skill-folder sync with conflicts")
+    p_bundle_sync.add_argument("--target", required=True, help="configured runtime target (grokbot defaults to its user workflows)")
+    p_bundle_sync.add_argument("--target-dir", help="override the target's user-owned skills directory")
+    p_bundle_sync.add_argument("--direction", choices=("both", "import", "export"), default="both")
+    p_bundle_sync.add_argument("--dry-run", action="store_true", help="report without changing files or Git")
+    p_bundle_sync.add_argument("--git", action="store_true", help="fast-forward pull, sync, commit imported bundles and push")
+    p_bundle_sync.add_argument("--json", action="store_true", help="emit a structured summary")
+    p_bundle_sync.add_argument("--config", help="path to skillsync.json")
 
     p_stamp = sub.add_parser("stamp", help="mark port(s) as synced to the current source version")
     p_stamp.add_argument("skill", nargs="?", help="skill name (omit with --all)")
@@ -1926,6 +2188,7 @@ def main():
 
     {
         "init": cmd_init,
+        "sync": cmd_sync,
         "stamp": cmd_stamp,
         "sync-exact": cmd_sync_exact,
         "prepare-discovery": cmd_prepare_discovery,
