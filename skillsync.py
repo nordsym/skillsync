@@ -76,7 +76,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 CONFIG_FILE = "skillsync.json"
 MARKER_RE = re.compile(r"<!-- synced-from: [0-9a-f]+ -->\n?")
 SKILL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -1847,14 +1847,19 @@ READ_ONLY_SKILL_PARTS = {'.cursor', 'plugins', '.plugins', 'node_modules'}
 
 
 def bundle_root(path):
+    """Resolve a configured root alias, then operate only on its pinned path.
+
+    A runtime may alias its data root (Grok Bot's agent-data does). This is
+    distinct from following symlinks inside a skill, which remains forbidden.
+    Neither spelling of a root may select a read-only managed skill tree.
+    """
     path = Path(os.path.abspath(str(Path(path).expanduser())))
-    if any(part in READ_ONLY_SKILL_PARTS for part in path.parts):
+    resolved = path.resolve()
+    if any(part in READ_ONLY_SKILL_PARTS for root in (path, resolved) for part in root.parts):
         raise ValueError('Cursor/plugin-managed skill roots are read-only')
-    if any(parent.is_symlink() for parent in [path, *path.parents]):
-        raise ValueError('Skill root must not traverse a symlink')
-    if path.exists() and not path.is_dir():
+    if resolved.exists() and not resolved.is_dir():
         raise ValueError('Skill root must be a directory')
-    return path
+    return resolved
 
 
 def bundle_snapshot(folder):
