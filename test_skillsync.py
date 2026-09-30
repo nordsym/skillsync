@@ -360,7 +360,7 @@ class PromotionAndSnapshotTests(unittest.TestCase):
 
 class PublicCliContractTests(unittest.TestCase):
     def test_version_matches_release_line(self):
-        self.assertEqual(skillsync.__version__, "0.6.0")
+        self.assertEqual(skillsync.__version__, "0.8.0")
 
     def test_readme_commands_exist_in_cli_help(self):
         readme = Path(__file__).with_name("README.md").read_text()
@@ -618,6 +618,267 @@ class VersionMatchTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-qam", "two"], cwd=root, check=True)
             second = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
             self.assertFalse(skillsync.versions_match(root, first[:7], second[:8]))
+
+class BundleSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.repo = self.root / 'repo'
+        self.repo.mkdir()
+        self.git(self.repo, 'init', '-q')
+        self.git(self.repo, 'config', 'user.name', 'Test')
+        self.git(self.repo, 'config', 'user.email', 'test@example.test')
+        self.source = self.repo / 'skills'
+        self.source.mkdir()
+        self.target = self.root / 'workflows'
+        self.target.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, root, *args):
+        return subprocess.check_output(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.test', *args], cwd=root, text=True).strip()
+
+    def skill(self, root, name='demo', content=None):
+        path = root / name / 'SKILL.md'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content or b'---\r\nname: demo\r\ndescription: test\r\nlicense: MIT\r\ncompatibility: grok\r\nsource: upstream\r\nmetadata:\r\n  nested: [one, two]\r\nunknown: |\r\n  preserve me\r\n---\r\n# Exact body\r\n')
+        return path
+
+    def sync(self, **kwargs):
+        return skillsync.sync_bundles(self.source, self.target, 'grokbot', **kwargs)
+
+    def test_frontmatter_and_binary_helper_bytes_and_modes_preserved_both_directions(self):
+        original = self.skill(self.target)
+        helper = original.parent / 'tools' / 'run.sh'
+        helper.parent.mkdir()
+        helper.write_bytes(b'#!/bin/sh\n\x00\xff\n')
+        helper.chmod(0o755)
+        (original.parent / 'LICENSE').write_bytes(b'MIT\r\n')
+        report = self.sync()
+        self.assertEqual(report['summary']['added'], 1)
+        self.assertEqual((self.source / 'demo/SKILL.md').read_bytes(), original.read_bytes())
+        self.assertEqual((self.source / 'demo/tools/run.sh').read_bytes(), helper.read_bytes())
+        self.assertTrue((self.source / 'demo/tools/run.sh').stat().st_mode & 0o111)
+        changed = original.read_bytes() + b'new repo edit\n'
+        (self.source / 'demo/SKILL.md').write_bytes(changed)
+        self.assertEqual(self.sync()['summary']['changed'], 1)
+        self.assertEqual(original.read_bytes(), changed)
+        self.assertEqual(self.sync()['summary']['skipped'], 1)
+
+    def test_game_builder_verbatim_six_file_roundtrip(self):
+        import shutil
+        fixture = Path(__file__).parent / 'tests/fixtures/game-builder'
+        shutil.copytree(fixture, self.target / 'game-builder')
+        self.sync()
+        second_box = self.root / 'new-box'
+        skillsync.sync_bundles(self.source, second_box, 'grokbot')
+        self.assertEqual(len(list(fixture.iterdir())), 6)
+        for item in fixture.iterdir():
+            self.assertEqual((second_box / 'game-builder' / item.name).read_bytes(), item.read_bytes())
+            self.assertEqual((self.source / 'game-builder' / item.name).read_bytes(), item.read_bytes())
+
+    def test_three_way_repo_change_exports_box_change_imports(self):
+        box = self.skill(self.target)
+        self.sync()
+        box.write_bytes(box.read_bytes() + b'box edit')
+        self.assertEqual(self.sync()['entries'][0]['direction'], 'import')
+        repo = self.source / 'demo/SKILL.md'
+        repo.write_bytes(repo.read_bytes() + b'repo edit')
+        self.assertEqual(self.sync()['entries'][0]['direction'], 'export')
+        self.assertEqual(box.read_bytes(), repo.read_bytes())
+
+    def test_both_helper_edits_conflict_and_future_mtime_does_not_choose_a_winner(self):
+        self.skill(self.target)
+        helper = self.target / 'demo/helper'
+        helper.write_bytes(b'base')
+        self.sync()
+        helper.write_bytes(b'box')
+        (self.source / 'demo/helper').write_bytes(b'repo')
+        os.utime(self.source / 'demo/helper', (4000000000, 4000000000))
+        self.assertEqual(self.sync()['summary']['conflict'], 1)
+        self.assertEqual(helper.read_bytes(), b'box')
+        self.assertEqual((self.source / 'demo/helper').read_bytes(), b'repo')
+
+    def test_initial_divergence_and_missing_previously_synced_copy_conflict(self):
+        self.skill(self.target, content=b'box')
+        self.skill(self.source, content=b'repo')
+        self.assertEqual(self.sync()['summary']['conflict'], 1)
+        (self.source / 'demo/SKILL.md').write_bytes(b'box')
+        self.sync()
+        import shutil
+        shutil.rmtree(self.source / 'demo')
+        self.assertEqual(self.sync()['summary']['conflict'], 1)
+        self.assertFalse((self.source / 'demo').exists())
+
+    def test_dry_run_does_not_write_baseline_or_skills(self):
+        self.skill(self.target)
+        state = skillsync.bundle_state_path(self.source, self.target, 'grokbot')
+        self.assertEqual(self.sync(dry_run=True)['summary']['added'], 1)
+        self.assertFalse(state.exists())
+        self.assertFalse((self.source / 'demo').exists())
+
+    def test_import_export_direction_skip_opposite_edits(self):
+        self.skill(self.target)
+        self.assertEqual(self.sync(direction='export')['summary']['skipped'], 1)
+        self.assertFalse((self.source / 'demo').exists())
+        self.sync(direction='import')
+        (self.source / 'demo/SKILL.md').write_bytes(b'repo change')
+        self.assertEqual(self.sync(direction='import')['summary']['skipped'], 1)
+
+    def test_readonly_cursor_plugins_and_symlinks_are_never_copied(self):
+        self.skill(self.target, 'good')
+        external = self.root / '.cursor/plugins'
+        self.skill(external, 'vendor')
+        (self.target / 'linked').symlink_to(external / 'vendor', target_is_directory=True)
+        internal = self.skill(self.target, 'internal-link')
+        (internal.parent / 'helper').symlink_to(external / 'vendor/SKILL.md')
+        readonly = self.skill(self.target, 'readonly')
+        readonly.parent.chmod(0o555)
+        try:
+            report = self.sync()
+            self.assertEqual(report['summary']['added'], 1)
+            self.assertEqual(report['summary']['skipped'], 3)
+            self.assertFalse((self.source / 'vendor').exists())
+            self.assertFalse((self.source / 'linked').exists())
+            self.assertFalse((self.source / 'internal-link').exists())
+            self.assertFalse((self.source / 'readonly').exists())
+            with self.assertRaisesRegex(ValueError, 'read-only'):
+                skillsync.sync_bundles(self.source, external, 'grokbot')
+        finally:
+            readonly.parent.chmod(0o755)
+
+    def test_readonly_skill_file_is_skipped_even_with_a_writable_folder(self):
+        skill = self.skill(self.target)
+        skill.chmod(0o444)
+        try:
+            report = self.sync()
+            self.assertEqual(report['summary']['skipped'], 1)
+            self.assertFalse((self.source / 'demo').exists())
+        finally:
+            skill.chmod(0o644)
+
+    def test_copy_rechecks_destination_before_replacement(self):
+        origin = self.skill(self.source)
+        dest = self.skill(self.target)
+        expected_origin = skillsync.bundle_snapshot(origin.parent)
+        expected_dest = skillsync.bundle_snapshot(dest.parent)
+        dest.write_bytes(b'concurrent box edit')
+        with self.assertRaisesRegex(ValueError, 'changed during sync'):
+            skillsync.replace_bundle(origin.parent, dest.parent, expected_origin, expected_dest)
+        self.assertEqual(dest.read_bytes(), b'concurrent box edit')
+
+    def test_unsafe_counterpart_cannot_be_overwritten(self):
+        external = self.root / 'external'
+        self.skill(external)
+        self.skill(self.source)
+        (self.target / 'demo').symlink_to(external / 'demo', target_is_directory=True)
+        self.assertEqual(self.sync()['summary']['conflict'], 1)
+        self.assertTrue((self.target / 'demo').is_symlink())
+
+    def test_overlap_symlink_root_and_malformed_state_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, 'overlap'):
+            skillsync.sync_bundles(self.source, self.repo, 'grokbot')
+        alias = self.root / 'alias'
+        alias.symlink_to(self.target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            skillsync.sync_bundles(self.source, alias, 'grokbot')
+        state = skillsync.bundle_state_path(self.source, self.target, 'grokbot')
+        state.parent.mkdir(parents=True)
+        state.write_text('{"demo": "not a hash"}')
+        with self.assertRaisesRegex(ValueError, 'baseline'):
+            self.sync()
+
+    def test_legacy_flat_source_collision_is_not_rewritten(self):
+        self.skill(self.target)
+        flat = self.source / 'demo.md'
+        flat.write_bytes(b'# Legacy vault Core')
+        self.assertEqual(self.sync()['summary']['conflict'], 1)
+        self.assertEqual(flat.read_bytes(), b'# Legacy vault Core')
+
+    def test_legacy_rendering_commands_skip_or_refuse_grokbot(self):
+        port = self.skill(self.target)
+        original = port.read_bytes()
+        (self.source / 'demo.md').write_text('# Demo\n')
+        config = {'source_dir': str(self.source), 'targets': {'grokbot': str(self.target)}}
+        with patch.object(skillsync, 'load_config', return_value=config), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_stamp(SimpleNamespace(skill=None, all=True))
+            skillsync.cmd_sync_exact(SimpleNamespace(skill=None, all=True, reviewed=True, create_missing=True))
+            for fn in (skillsync.cmd_prepare_discovery, skillsync.cmd_compact_descriptions, skillsync.cmd_scaffold):
+                with self.assertRaisesRegex(SystemExit, 'lossless'):
+                    fn(SimpleNamespace(target='grokbot', skill='demo', reviewed=True, force=True))
+        self.assertEqual(port.read_bytes(), original)
+
+    def test_concurrent_conflict_prevents_git_publication(self):
+        config = {'source_dir': str(self.source), 'targets': {'grokbot': str(self.target)}}
+        entries = [{'skill': 'demo', 'status': 'added', 'direction': 'import'}]
+        preview = {'entries': entries, 'summary': {'conflict': 0}, 'dry_run': True}
+        conflict = {'entries': entries + [{'skill': 'other', 'status': 'conflict'}],
+                    'summary': {'conflict': 1}, 'dry_run': False}
+        args = SimpleNamespace(target='grokbot', target_dir=None, direction='both',
+                               dry_run=False, git=True, json=True)
+        with patch.object(skillsync, 'load_config', return_value=config), \
+                patch.object(skillsync, 'sync_git', side_effect=['', '0', '']) as git, \
+                patch.object(skillsync, 'sync_bundles', side_effect=[preview, conflict]), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            skillsync.cmd_sync(args)
+        self.assertEqual([call.args[1] for call in git.call_args_list],
+                         ['status', 'rev-list', 'pull'])
+
+    def test_git_transport_two_clones_conflicts_and_scoped_commit(self):
+        remote = self.root / 'remote.git'
+        remote.mkdir()
+        self.git(remote, 'init', '--bare', '-q')
+        self.skill(self.source)
+        config = self.repo / 'skillsync.json'
+        config.write_text(json.dumps({'source_dir': './skills', 'targets': {'grokbot': str(self.target)}}))
+        self.git(self.repo, 'add', '.')
+        self.git(self.repo, 'commit', '-qm', 'seed')
+        self.git(self.repo, 'remote', 'add', 'origin', str(remote))
+        self.git(self.repo, 'push', '-qu', 'origin', 'HEAD')
+        clone = self.root / 'second'
+        self.git(self.root, 'clone', '-q', str(remote), str(clone))
+        args = SimpleNamespace(target='grokbot', target_dir=None, direction='both', dry_run=False, git=True, json=True)
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_sync(args)
+        box = self.target / 'demo/SKILL.md'
+        box.write_bytes(box.read_bytes() + b'box edit\n')
+        (clone / 'skills/demo/SKILL.md').write_bytes(b'remote edit\n')
+        self.git(clone, 'commit', '-qam', 'remote change')
+        self.git(clone, 'push', '-q')
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            skillsync.cmd_sync(args)
+        self.assertTrue(box.read_bytes().endswith(b'box edit\n'))
+        self.assertEqual((self.source / 'demo/SKILL.md').read_bytes(), b'remote edit\n')
+        self.assertEqual(self.git(self.repo, 'status', '--porcelain'), '')
+        # Resolve explicitly by making the copies equal, then a box-only edit is imported and pushed.
+        box.write_bytes(b'remote edit\n')
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_sync(args)
+            box.write_bytes(b'new box edit\n')
+            skillsync.cmd_sync(args)
+        self.assertEqual(self.git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(self.git(self.repo, 'rev-list', '--count', '@{upstream}..HEAD'), '0')
+        self.git(clone, 'pull', '--ff-only', '-q')
+        self.assertEqual((clone / 'skills/demo/SKILL.md').read_bytes(), b'new box edit\n')
+        # Dry-run does not even fetch/pull a remote update.
+        before = self.git(self.repo, 'rev-parse', 'HEAD')
+        (clone / 'skills/demo/SKILL.md').write_bytes(b'next remote\n')
+        self.git(clone, 'commit', '-qam', 'next')
+        self.git(clone, 'push', '-q')
+        args.dry_run = True
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_sync(args)
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(box.read_bytes(), b'new box edit\n')
+        args.dry_run = False
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), contextlib.redirect_stdout(io.StringIO()):
+            skillsync.cmd_sync(args)
+        self.assertEqual(box.read_bytes(), b'next remote\n')
+        (self.repo / 'unrelated').write_bytes(b'preserve')
+        with patch.object(skillsync, 'CONFIG_FILE', str(config)), self.assertRaisesRegex(SystemExit, 'clean checkout'):
+            skillsync.cmd_sync(args)
+
 
 if __name__ == "__main__":
     unittest.main()

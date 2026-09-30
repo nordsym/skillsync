@@ -31,3 +31,4 @@ jobs:
         run: |
           python skillsync.py --version
           python skillsync.py --help
+          python skillsync.py sync --help
